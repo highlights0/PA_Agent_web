@@ -17,10 +17,11 @@ from app.services.analysis_service import (
     AnalysisConfigurationError,
     InsufficientMarketDataError,
 )
+from app.services.provider_registry import UnsupportedMarketProvider
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-_SYMBOL_RE = re.compile(r"^[A-Z0-9]{3,24}$")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9-]{3,24}$")
 _TIMEFRAMES = {
     "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h",
     "8h", "12h", "1d", "3d", "1w", "1M",
@@ -31,14 +32,13 @@ class AnalysisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     market: MarketType
+    exchange: Literal["binance", "binance_us", "coinbase"] = "binance"
     symbol: str = Field(min_length=3, max_length=24)
     timeframe: str = "15m"
     analysis_bars: int = Field(default=100, ge=20, le=250)
 
 
 def _client_ip(request: Request) -> str:
-    # Nginx overwrites X-Real-IP from the actual TCP peer. The backend port is
-    # internal-only in Compose; do not trust arbitrary forwarded headers.
     forwarded = request.headers.get("x-real-ip", "").strip()
     if forwarded:
         return forwarded[:64]
@@ -55,7 +55,6 @@ def _safe_error(record_exception: object) -> dict | None:
     }
     if record_exception.get("message"):
         safe["message"] = str(record_exception["message"])[:500]
-    # Never return raw_text, prompts, provider payloads, or reasoning_content.
     return safe
 
 
@@ -116,21 +115,24 @@ async def submit_analysis(payload: AnalysisRequest, request: Request):
             symbol,
             payload.timeframe,
             payload.analysis_bars,
+            payload.exchange,
         )
     except AnalysisConfigurationError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except InsufficientMarketDataError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except UnsupportedMarketProvider as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except BinanceAPIError as exc:
         if exc.status_code in (418, 429):
             raise HTTPException(
                 status_code=503,
-                detail="Binance is rate-limiting this service; retry later",
+                detail="Selected exchange is rate-limiting this service; retry later",
                 headers={"Retry-After": exc.retry_after or "5"},
             ) from exc
         raise HTTPException(
             status_code=502,
-            detail="Binance market data is temporarily unavailable",
+            detail=f"Selected exchange market data is unavailable (HTTP {exc.status_code or 'network error'})",
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -147,6 +149,7 @@ async def submit_analysis(payload: AnalysisRequest, request: Request):
         "analysis_id": str(uuid4()),
         "status": "completed" if record.exception is None else "failed",
         "market": payload.market,
+        "exchange": payload.exchange,
         "symbol": symbol,
         "timeframe": payload.timeframe,
         "bar_count": record.meta.bar_count,

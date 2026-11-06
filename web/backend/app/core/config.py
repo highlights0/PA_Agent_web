@@ -22,6 +22,10 @@ class Settings:
     app_env: str = os.getenv("APP_ENV", "development")
     spot_rest_url: str = os.getenv("BINANCE_SPOT_REST_URL", "https://api.binance.com")
     futures_rest_url: str = os.getenv("BINANCE_USDM_REST_URL", "https://fapi.binance.com")
+    binance_us_spot_rest_url: str = os.getenv("BINANCE_US_SPOT_REST_URL", "https://api.binance.us")
+    coinbase_spot_rest_url: str = os.getenv(
+        "COINBASE_SPOT_REST_URL", "https://api.exchange.coinbase.com"
+    )
     request_timeout_seconds: float = float(os.getenv("BINANCE_HTTP_TIMEOUT", "10"))
     max_klines: int = int(os.getenv("PUBLIC_MAX_BARS", "300"))
     cors_origins: tuple[str, ...] = _csv_env(

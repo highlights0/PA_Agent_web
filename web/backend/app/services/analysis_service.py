@@ -45,7 +45,7 @@ def _context_period(timeframe: str) -> str:
         return timeframe
     if timeframe in {"1m", "3m"}:
         return "5m"
-    if timeframe in {"8h"}:
+    if timeframe == "8h":
         return "6h"
     return "1d"
 
@@ -63,15 +63,19 @@ class AnalysisService:
         symbol: str,
         timeframe: str,
         analysis_bars: int = 100,
+        exchange: str = "binance",
     ) -> AnalysisRun:
         if not self._web_settings.ai_api_key.strip():
             raise AnalysisConfigurationError("AI_API_KEY is not configured on the server")
         if analysis_bars < 20 or analysis_bars + 50 > self._web_settings.max_klines:
             raise ValueError("analysis_bars must be between 20 and server max bars minus 50")
+        if market == "usdm" and exchange != "binance":
+            raise ValueError(
+                f"{exchange} USD-M futures are not configured; no cross-exchange substitution is allowed"
+            )
 
-        # Fetch 50 older closed candles for the original EMA20/ATR14 warm-up.
         rows = await self._market.klines(
-            market, symbol, timeframe, analysis_bars + 50
+            market, symbol, timeframe, analysis_bars + 50, exchange
         )
         core_bars = to_core_bars(rows)
         from pa_agent.data.snapshot import build_analysis_frame
@@ -89,8 +93,7 @@ class AnalysisService:
 
         if market == "usdm":
             derivatives = await self._market.futures_context(
-                symbol,
-                _context_period(timeframe),
+                symbol, _context_period(timeframe)
             )
             context = CryptoMarketContext(
                 market_type=market,
@@ -100,10 +103,13 @@ class AnalysisService:
             import time
 
             context = CryptoMarketContext(
-                market_type=market,
+                market_type=f"spot:{exchange}",
                 symbol=symbol,
                 data_timestamp=int(time.time() * 1000),
-                data_quality={"derivatives": "not_applicable_for_spot"},
+                data_quality={
+                    "derivatives": "not_available_from_selected_spot_provider",
+                    "quote_volume": "not_provided_by_coinbase" if exchange == "coinbase" else "available",
+                },
             )
 
         return await asyncio.to_thread(self._run_sync, frame, context)
@@ -150,7 +156,6 @@ class AnalysisService:
             settings=settings,
         )
         events: list[str] = []
-
         record = orchestrator.submit(
             frame=frame,
             cancel_token=CancelToken(),

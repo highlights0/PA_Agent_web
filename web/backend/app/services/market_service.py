@@ -1,11 +1,10 @@
-"""Application-level market service for Binance Spot and USDⓈ-M Futures."""
+"""Multi-exchange market service with explicit source attribution."""
 from __future__ import annotations
 
 import asyncio
 import time
 from typing import Any
 
-from app.adapters.binance.futures_rest import BinanceUSDMREST
 from app.adapters.binance.models import (
     FuturesContextDTO,
     KlineDTO,
@@ -13,61 +12,95 @@ from app.adapters.binance.models import (
     MarketType,
     TickerDTO,
 )
-from app.adapters.binance.normalizer import normalize_klines
-from app.adapters.binance.spot_rest import BinanceSpotREST
+from app.adapters.binance.normalizer import normalize_coinbase_klines, normalize_klines
+from app.services.provider_registry import ProviderRegistry
 
 
 class MarketService:
-    def __init__(self, spot: BinanceSpotREST, futures: BinanceUSDMREST) -> None:
-        self._spot = spot
-        self._futures = futures
-        self._symbol_cache: dict[str, tuple[float, list[MarketSymbol]]] = {}
+    def __init__(self, providers: ProviderRegistry, binance_futures: Any) -> None:
+        self._providers = providers
+        self._binance_futures = binance_futures
+        self._symbol_cache: dict[tuple[str, str], tuple[float, list[MarketSymbol]]] = {}
         self._cache_lock = asyncio.Lock()
 
-    def _client(self, market: MarketType):
-        return self._spot if market == "spot" else self._futures
+    @property
+    def supported_exchanges(self) -> dict[str, list[str]]:
+        return self._providers.supported
 
-    async def markets(self, market: MarketType) -> list[MarketSymbol]:
-        cached = self._symbol_cache.get(market)
+    def _provider(self, market: MarketType, exchange: str):
+        return self._providers.get(exchange, market)
+
+    async def markets(
+        self, market: MarketType, exchange: str = "binance"
+    ) -> list[MarketSymbol]:
+        key = (exchange, market)
+        cached = self._symbol_cache.get(key)
         if cached and cached[0] > time.monotonic():
             return cached[1]
 
         async with self._cache_lock:
-            cached = self._symbol_cache.get(market)
+            cached = self._symbol_cache.get(key)
             if cached and cached[0] > time.monotonic():
                 return cached[1]
 
-            payload = await self._client(market).exchange_info()
+            payload = await self._provider(market, exchange).exchange_info()
             symbols: list[MarketSymbol] = []
-            for item in payload.get("symbols", []):
-                if item.get("status") != "TRADING" or item.get("quoteAsset") != "USDT":
-                    continue
-                if market == "spot":
-                    if item.get("isSpotTradingAllowed") is False:
+            if exchange == "coinbase":
+                for item in payload.get("products", []):
+                    if item.get("status") != "online" or item.get("trading_disabled"):
                         continue
-                elif item.get("contractType") != "PERPETUAL":
-                    continue
-                symbols.append(
-                    MarketSymbol(
-                        symbol=item["symbol"],
-                        base_asset=item["baseAsset"],
-                        quote_asset=item["quoteAsset"],
-                        market=market,
-                        status=item["status"],
+                    product_id = str(item.get("id", ""))
+                    if not product_id:
+                        continue
+                    symbols.append(
+                        MarketSymbol(
+                            symbol=product_id,
+                            base_asset=str(item.get("base_currency", "")),
+                            quote_asset=str(item.get("quote_currency", "")),
+                            market=market,
+                            status="TRADING",
+                            exchange=exchange,
+                        )
                     )
-                )
+            else:
+                for item in payload.get("symbols", []):
+                    if item.get("status") != "TRADING":
+                        continue
+                    if market == "spot" and item.get("isSpotTradingAllowed") is False:
+                        continue
+                    if market == "usdm" and item.get("contractType") != "PERPETUAL":
+                        continue
+                    symbols.append(
+                        MarketSymbol(
+                            symbol=item["symbol"],
+                            base_asset=item["baseAsset"],
+                            quote_asset=item["quoteAsset"],
+                            market=market,
+                            status=item["status"],
+                            exchange=exchange,
+                        )
+                    )
             symbols.sort(key=lambda item: item.symbol)
-            self._symbol_cache[market] = (time.monotonic() + 300, symbols)
+            self._symbol_cache[key] = (time.monotonic() + 300, symbols)
             return symbols
 
     async def klines(
-        self, market: MarketType, symbol: str, interval: str, limit: int
+        self,
+        market: MarketType,
+        symbol: str,
+        interval: str,
+        limit: int,
+        exchange: str = "binance",
     ) -> list[KlineDTO]:
-        rows = await self._client(market).klines(symbol, interval, limit)
+        rows = await self._provider(market, exchange).klines(symbol, interval, limit)
+        if exchange == "coinbase":
+            return normalize_coinbase_klines(rows, interval=interval)
         return normalize_klines(rows)
 
-    async def ticker(self, market: MarketType, symbol: str) -> TickerDTO:
-        raw = await self._client(market).ticker_24h(symbol)
+    async def ticker(
+        self, market: MarketType, symbol: str, exchange: str = "binance"
+    ) -> TickerDTO:
+        raw = await self._provider(market, exchange).ticker_24h(symbol)
         return TickerDTO(
             symbol=raw["symbol"],
             last_price=str(raw["lastPrice"]),
@@ -76,17 +109,18 @@ class MarketService:
             high_price=str(raw["highPrice"]),
             low_price=str(raw["lowPrice"]),
             volume=str(raw["volume"]),
-            quote_volume=str(raw["quoteVolume"]),
+            quote_volume=str(raw.get("quoteVolume", "")),
+            exchange=exchange,
         )
 
     async def futures_context(self, symbol: str, period: str = "15m") -> FuturesContextDTO:
-        """Fetch optional derivatives context independently; partial data is preserved."""
+        """Binance USD-M context; another exchange must implement this explicitly."""
         tasks = {
-            "premium": self._futures.premium_index(symbol),
-            "open_interest": self._futures.open_interest(symbol),
-            "oi_history": self._futures.open_interest_history(symbol, period, 2),
-            "long_short": self._futures.global_long_short_ratio(symbol, period),
-            "taker": self._futures.taker_long_short_ratio(symbol, period),
+            "premium": self._binance_futures.premium_index(symbol),
+            "open_interest": self._binance_futures.open_interest(symbol),
+            "oi_history": self._binance_futures.open_interest_history(symbol, period, 2),
+            "long_short": self._binance_futures.global_long_short_ratio(symbol, period),
+            "taker": self._binance_futures.taker_long_short_ratio(symbol, period),
         }
         names = list(tasks)
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)

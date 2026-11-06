@@ -1,4 +1,5 @@
 export type Market = "spot" | "usdm";
+export type Exchange = "binance" | "binance_us" | "coinbase";
 
 export interface Kline {
   open_time: number;
@@ -24,12 +25,14 @@ export interface Ticker {
   low_price: string;
   volume: string;
   quote_volume: string;
+  exchange: Exchange;
 }
 
 export interface AnalysisResult {
   analysis_id: string;
   status: "completed" | "failed";
   market: Market;
+  exchange: Exchange;
   symbol: string;
   timeframe: string;
   bar_count: number;
@@ -58,18 +61,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  klines: (market: Market, symbol: string, interval: string, limit = 200) =>
+  klines: (market: Market, exchange: Exchange, symbol: string, interval: string, limit = 200) =>
     request<Kline[]>(
       "/api/v1/market/" + market + "/" + encodeURIComponent(symbol) +
-      "/klines?interval=" + encodeURIComponent(interval) + "&limit=" + limit,
+      "/klines?exchange=" + exchange + "&interval=" + encodeURIComponent(interval) + "&limit=" + limit,
     ),
-  ticker: (market: Market, symbol: string) =>
-    request<Ticker>("/api/v1/market/" + market + "/" + encodeURIComponent(symbol) + "/ticker"),
-  analyze: (market: Market, symbol: string, timeframe: string, analysisBars = 100) =>
+  ticker: (market: Market, exchange: Exchange, symbol: string) =>
+    request<Ticker>(
+      "/api/v1/market/" + market + "/" + encodeURIComponent(symbol) + "/ticker?exchange=" + exchange,
+    ),
+  analyze: (market: Market, exchange: Exchange, symbol: string, timeframe: string, analysisBars = 100) =>
     request<AnalysisResult>("/api/v1/analysis", {
       method: "POST",
       body: JSON.stringify({
         market,
+        exchange,
         symbol,
         timeframe,
         analysis_bars: analysisBars,

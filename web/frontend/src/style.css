@@ -87,3 +87,14 @@ footer { padding: 24px 0 0; color: #53667f; font-size: 10px; text-align: center;
   .chart-panel { padding: 13px 10px; }
   .chart-host { height: 340px; }
 }
+
+.notice-banner {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid #72551f;
+  border-radius: 9px;
+  color: #f6d68a;
+  background: #422f0b55;
+  font-size: 12px;
+  line-height: 1.65;
+}

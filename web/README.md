@@ -1,19 +1,31 @@
 # PA Crypto Agent Web
 
-This directory contains the Web implementation for the PA_Agent fork.
+Multi-exchange Web market-data and original PA analysis foundation.
 
-## Current status
+## Current exchange coverage
 
-- P0 architecture audit completed.
-- P1 Binance public REST foundation implemented for Spot and USDⓈ-M Futures.
-- Basic Vue 3 market screen implemented.
-- P2 internal analysis adapter uses the original KlineFrame, PromptAssembler, JsonValidator, and TwoStageOrchestrator. Binance derivatives context is appended to both analysis stages without replacing the original PA rules.
-- P3 guarded synchronous analysis endpoint and Vue analysis panel implemented. It is disabled by default and requires a server-side AI key plus an explicit operator opt-in.
-- Persistent monitoring workers, durable public quotas, database-backed analysis history, Redis job queue, and opportunity lifecycle are not yet implemented. This is not yet a production-ready public trading-analysis service.
+| Exchange | Spot candles/ticker | USDⓈ-M Futures |
+|---|---|---|
+| Binance Global | Yes | Yes |
+| Binance.US | Yes | Not offered by this adapter |
+| Coinbase Exchange | Yes | Not offered by this adapter |
+| Coinbase Derivatives | Not applicable | FIX/UDP market-data integration is a separate future task |
 
-## Local development
+The API does not silently replace one exchange with another. Every response is associated with an explicitly selected exchange. Binance Global can still return HTTP 451 depending on the network region or IP. When that happens, use Coinbase Exchange or Binance.US for Spot if those services are available from the current network.
 
-Backend (run from repository root):
+Coinbase Exchange uses BASE-QUOTE symbols such as BTC-USD and ETH-USD. Binance uses symbols such as BTCUSDT. These are different markets and quote currencies; do not concatenate their candles into one time series or treat USD and USDT as identical.
+
+Coinbase public candles provide OHLCV but do not provide Binance-style taker-buy volumes, trade counts, or quote-volume fields in this adapter. Such fields remain empty/unavailable rather than being fabricated.
+
+## Futures limitation
+
+The Binance USDⓈ-M Futures adapter still calls Binance Global's fapi endpoint. This may be region-restricted. Coinbase Derivatives offers US perpetual-style futures, but its market-data access is documented through FIX and UDP rather than the simple public REST candle API used here. It must not be represented as already supported. A separate FIX/UDP market-data adapter and entitlement/access setup are required before it can be used.
+
+No Binance account access, order, cancel, transfer, or withdrawal endpoints are implemented.
+
+## Local development (Windows CMD)
+
+From repository root:
 
 ~~~cmd
 python -m venv .venv
@@ -25,22 +37,7 @@ set PYTHONPATH=web\backend
 python -m uvicorn app.main:app --app-dir web\backend --reload
 ~~~
 
-If pip reports a dependency-resolution error for OpenAI/jiter, first check whether a private or stale package mirror is configured:
-
-~~~cmd
-python -m pip config list
-python -m pip index versions jiter
-~~~
-
-Then retry against the official PyPI index:
-
-~~~cmd
-python -m pip install -i https://pypi.org/simple -r web/backend/requirements.txt
-~~~
-
-The Web requirements intentionally constrain the OpenAI SDK to the 1.x API line used by the existing PA client and declare its jiter dependency explicitly. This avoids accidentally selecting a future major SDK release. If the resolver still fails, capture the complete output including the final conflicting-package lines; do not randomly downgrade unrelated packages.
-
-Frontend:
+In a second CMD:
 
 ~~~cmd
 cd web\frontend
@@ -48,41 +45,27 @@ npm install
 npm run dev
 ~~~
 
-The Vite development server proxies /api to http://127.0.0.1:8000.
+Open http://localhost:5173.
 
-## API
+## Market API
 
-- GET /api/v1/health
-- GET /api/v1/markets?market=spot|usdm
-- GET /api/v1/market/{market}/{symbol}/klines?interval=15m&limit=200
-- GET /api/v1/market/{market}/{symbol}/ticker
-- GET /api/v1/market/usdm/{symbol}/context?period=15m
-- GET /api/v1/analysis/quota
-- POST /api/v1/analysis
+- GET /api/v1/exchanges
+- GET /api/v1/markets?market=spot&exchange=coinbase
+- GET /api/v1/market/spot/BTC-USD/klines?exchange=coinbase&interval=15m&limit=200
+- GET /api/v1/market/spot/BTC-USD/ticker?exchange=coinbase
+- GET /api/v1/market/spot/BTCUSDT/klines?exchange=binance_us&interval=15m&limit=200
+- GET /api/v1/market/usdm/BTCUSDT/klines?exchange=binance&interval=15m&limit=200
 
-The analysis endpoint runs the original two-stage PA pipeline in a worker thread and returns a sanitized structured result. It does not expose prompts, raw provider payloads, reasoning_content, or API keys.
+Supported exchange capabilities are returned by /api/v1/exchanges.
 
-## Enable AI analysis
+## AI configuration
 
-1. Set AI_API_KEY, AI_BASE_URL, and AI_MODEL in the server-side .env file.
-2. Set PUBLIC_ANALYSIS_ENABLED=true.
-3. Keep PUBLIC_MAX_CONCURRENT_ANALYSES low (default 1).
-
-The current public quota is an in-memory per-IP UTC-day counter. It is suitable only for a single-process staging deployment; it resets on restart and is not shared between replicas. Keep the default PUBLIC_ANALYSIS_ENABLED=false on a public production host until the Redis-backed quota, guest-session isolation, persistent job queue, and durable audit records are implemented.
-
-The Web service never requests Binance trading permissions and contains no order, cancel, transfer, or withdrawal endpoints.
-
-## Environment
-
-See repository-root .env.example. AI credentials are read only by the backend process and are never sent to the browser.
+AI_API_KEY, AI_BASE_URL, and AI_MODEL are server-side environment variables. Public analysis remains disabled by default. The current quota is an in-memory per-IP UTC-day counter and is suitable only for single-process staging, not a multi-replica public launch.
 
 ## Docker
 
-From repository root:
-
 ~~~bash
 cp .env.example .env
-# Configure server-side AI_API_KEY and explicitly enable analysis only for a protected staging test.
 docker compose -f deploy/docker-compose.yml up --build -d
 ~~~
 

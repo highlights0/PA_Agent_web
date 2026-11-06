@@ -1,4 +1,4 @@
-"""Public market-data API routes. These endpoints never place orders."""
+"""Public multi-exchange market-data API. No trading or account endpoints."""
 from __future__ import annotations
 
 import re
@@ -8,13 +8,15 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.adapters.binance.client import BinanceAPIError
 from app.adapters.binance.models import MarketType
+from app.services.provider_registry import UnsupportedMarketProvider
 
 router = APIRouter()
 _INTERVALS = {
     "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h",
     "12h", "1d", "3d", "1w", "1M",
 }
-_SYMBOL_RE = re.compile(r"^[A-Z0-9]{3,24}$")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9-]{3,24}$")
+Exchange = Literal["binance", "binance_us", "coinbase"]
 
 
 def _service(request: Request):
@@ -28,51 +30,63 @@ def _validate_symbol(symbol: str) -> str:
     return normalized
 
 
-def _translate_error(exc: BinanceAPIError) -> HTTPException:
+def _translate_error(exc: BinanceAPIError, exchange: str) -> HTTPException:
     if exc.status_code in (418, 429):
         return HTTPException(
             status_code=503,
-            detail="Binance is rate-limiting this service; retry later.",
+            detail=f"{exchange} is rate-limiting this service; retry later.",
             headers={"Retry-After": exc.retry_after or "5"},
         )
     if exc.status_code == 451:
         return HTTPException(
             status_code=502,
             detail=(
-                "Binance returned HTTP 451 (Unavailable For Legal Reasons). "
-                "The Binance global API may be restricted for this network region or IP. "
-                "Test the same endpoint from another permitted network or use a supported exchange."
+                f"{exchange} returned HTTP 451 (Unavailable For Legal Reasons). "
+                "This exchange endpoint is restricted for the current network region or IP. "
+                "Select another supported market-data provider."
             ),
         )
     if exc.status_code == 403:
         return HTTPException(
             status_code=502,
-            detail=(
-                "Binance returned HTTP 403 (Forbidden). The request may be blocked by "
-                "Binance, a regional access rule, or an upstream security filter."
-            ),
+            detail=f"{exchange} returned HTTP 403 (Forbidden); access was denied upstream.",
         )
     if exc.status_code is not None and 400 <= exc.status_code < 500:
-        code = f", Binance code {exc.error_code}" if exc.error_code is not None else ""
-        message = str(exc)[:240]
+        code = f", upstream code {exc.error_code}" if exc.error_code is not None else ""
         return HTTPException(
             status_code=502,
-            detail=f"Binance returned HTTP {exc.status_code}{code}: {message}",
+            detail=f"{exchange} returned HTTP {exc.status_code}{code}: {str(exc)[:200]}",
         )
     if exc.status_code is None:
-        return HTTPException(status_code=502, detail=str(exc)[:240])
-    return HTTPException(status_code=502, detail="Binance market-data service is unavailable")
+        return HTTPException(status_code=502, detail=str(exc)[:200])
+    return HTTPException(status_code=502, detail=f"{exchange} market-data service is unavailable")
+
+
+def _provider_error(exchange: str, exc: Exception) -> HTTPException:
+    if isinstance(exc, BinanceAPIError):
+        return _translate_error(exc, exchange)
+    if isinstance(exc, UnsupportedMarketProvider):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=422, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"{exchange} market data request failed")
+
+
+@router.get("/exchanges")
+async def supported_exchanges(request: Request):
+    return _service(request).supported_exchanges
 
 
 @router.get("/markets")
 async def list_markets(
     request: Request,
     market: MarketType = Query(default="spot"),
+    exchange: Exchange = Query(default="binance"),
 ):
     try:
-        return await _service(request).markets(market)
-    except BinanceAPIError as exc:
-        raise _translate_error(exc) from exc
+        return await _service(request).markets(market, exchange)
+    except Exception as exc:
+        raise _provider_error(exchange, exc) from exc
 
 
 @router.get("/market/{market}/{symbol}/klines")
@@ -80,6 +94,7 @@ async def get_klines(
     request: Request,
     market: MarketType,
     symbol: str,
+    exchange: Exchange = Query(default="binance"),
     interval: str = Query(default="15m"),
     limit: int = Query(default=200, ge=20, le=1000),
 ):
@@ -92,20 +107,25 @@ async def get_klines(
         )
     try:
         return await _service(request).klines(
-            market, _validate_symbol(symbol), interval, limit
+            market, _validate_symbol(symbol), interval, limit, exchange
         )
-    except BinanceAPIError as exc:
-        raise _translate_error(exc) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail="Invalid Binance kline payload") from exc
+    except Exception as exc:
+        raise _provider_error(exchange, exc) from exc
 
 
 @router.get("/market/{market}/{symbol}/ticker")
-async def get_ticker(request: Request, market: MarketType, symbol: str):
+async def get_ticker(
+    request: Request,
+    market: MarketType,
+    symbol: str,
+    exchange: Exchange = Query(default="binance"),
+):
     try:
-        return await _service(request).ticker(market, _validate_symbol(symbol))
-    except BinanceAPIError as exc:
-        raise _translate_error(exc) from exc
+        return await _service(request).ticker(
+            market, _validate_symbol(symbol), exchange
+        )
+    except Exception as exc:
+        raise _provider_error(exchange, exc) from exc
 
 
 @router.get("/market/usdm/{symbol}/context")
@@ -116,5 +136,5 @@ async def get_futures_context(
 ):
     try:
         return await _service(request).futures_context(_validate_symbol(symbol), period)
-    except BinanceAPIError as exc:
-        raise _translate_error(exc) from exc
+    except Exception as exc:
+        raise _provider_error("binance", exc) from exc

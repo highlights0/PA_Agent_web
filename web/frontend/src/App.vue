@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ColorType, createChart, type IChartApi, type ISeriesApi } from "lightweight-charts";
-import { api, type AnalysisResult, type Kline, type Market, type Ticker } from "./api";
+import { api, type AnalysisResult, type Exchange, type Kline, type Market, type Ticker } from "./api";
 
-const market = ref<Market>("usdm");
-const symbol = ref("BTCUSDT");
+const market = ref<Market>("spot");
+const exchange = ref<Exchange>("coinbase");
+const symbol = ref("BTC-USD");
 const interval = ref("15m");
 const klines = ref<Kline[]>([]);
 const ticker = ref<Ticker | null>(null);
@@ -22,6 +23,11 @@ let refreshTimer: number | undefined;
 const changePositive = computed(() => Number(ticker.value?.price_change_percent ?? 0) >= 0);
 const diagnosis = computed<Record<string, any>>(() => analysis.value?.stage1_diagnosis ?? {});
 const decision = computed<Record<string, any>>(() => analysis.value?.stage2_decision?.decision ?? {});
+const exchangeLabel = computed(() => ({
+  binance: "Binance Global",
+  binance_us: "Binance.US",
+  coinbase: "Coinbase Exchange",
+}[exchange.value]));
 
 function createMarketChart() {
   if (!chartHost.value || chart) return;
@@ -54,11 +60,11 @@ async function loadMarket() {
   error.value = "";
   try {
     const normalized = symbol.value.trim().toUpperCase();
-    if (!/^[A-Z0-9]{3,24}$/.test(normalized)) throw new Error("交易对格式不正确");
+    if (!/^[A-Z0-9-]{3,24}$/.test(normalized)) throw new Error("交易对格式不正确");
     symbol.value = normalized;
     const [bars, quote] = await Promise.all([
-      api.klines(market.value, normalized, interval.value, 200),
-      api.ticker(market.value, normalized),
+      api.klines(market.value, exchange.value, normalized, interval.value, 200),
+      api.ticker(market.value, exchange.value, normalized),
     ]);
     klines.value = bars;
     ticker.value = quote;
@@ -89,8 +95,7 @@ async function runAnalysis() {
   analysis.value = null;
   try {
     const normalized = symbol.value.trim().toUpperCase();
-    if (!/^[A-Z0-9]{3,24}$/.test(normalized)) throw new Error("交易对格式不正确");
-    const result = await api.analyze(market.value, normalized, interval.value, 100);
+    const result = await api.analyze(market.value, exchange.value, normalized, interval.value, 100);
     analysis.value = result;
     if (result.status === "failed") {
       analysisError.value = result.error?.message || "AI 分析未通过校验";
@@ -102,12 +107,32 @@ async function runAnalysis() {
   }
 }
 
+function onMarketChange() {
+  analysis.value = null;
+  if (market.value === "usdm") {
+    exchange.value = "binance";
+    if (symbol.value.includes("-")) symbol.value = "BTCUSDT";
+  } else if (exchange.value === "binance") {
+    exchange.value = "coinbase";
+    if (!symbol.value.includes("-")) symbol.value = "BTC-USD";
+  }
+  void loadMarket();
+}
+
+function onExchangeChange() {
+  analysis.value = null;
+  if (market.value === "usdm") market.value = "spot";
+  if (exchange.value === "coinbase" && !symbol.value.includes("-")) symbol.value = "BTC-USD";
+  if (exchange.value !== "coinbase" && symbol.value.includes("-")) symbol.value = "BTCUSDT";
+  void loadMarket();
+}
+
 function formatNumber(value: string | undefined) {
   if (!value) return "--";
   return Number(value).toLocaleString("en-US", { maximumFractionDigits: 6 });
 }
 
-watch([market, interval], () => {
+watch(interval, () => {
   analysis.value = null;
   void loadMarket();
 });
@@ -134,14 +159,14 @@ onBeforeUnmount(() => {
           <div class="brand-subtitle">PRICE ACTION MARKET WORKSPACE</div>
         </div>
       </div>
-      <div class="connection"><span class="live-dot"></span> Binance 公共行情</div>
+      <div class="connection"><span class="live-dot"></span> 多交易所公开行情</div>
     </header>
 
     <section class="page-heading">
       <div>
         <div class="eyebrow">MARKET OVERVIEW</div>
         <h1>加密货币行情中心</h1>
-        <p>现货与 U 本位合约行情 · 原版 Price Action 两阶段分析</p>
+        <p>多交易所现货行情 · U 本位合约独立数据源 · 原版 Price Action 两阶段分析</p>
       </div>
       <div class="refresh-state">{{ loading ? "正在同步…" : "每 15 秒刷新" }}</div>
     </section>
@@ -149,10 +174,22 @@ onBeforeUnmount(() => {
     <section class="toolbar panel">
       <label>
         <span>市场</span>
-        <select v-model="market">
+        <select v-model="market" @change="onMarketChange">
           <option value="spot">现货 Spot</option>
           <option value="usdm">U 本位合约</option>
         </select>
+      </label>
+      <label v-if="market === 'spot'">
+        <span>交易所</span>
+        <select v-model="exchange" @change="onExchangeChange">
+          <option value="coinbase">Coinbase Exchange</option>
+          <option value="binance_us">Binance.US</option>
+          <option value="binance">Binance Global</option>
+        </select>
+      </label>
+      <label v-else>
+        <span>合约数据源</span>
+        <select disabled><option>Binance USDⓈ-M</option></select>
       </label>
       <label class="symbol-field">
         <span>交易对</span>
@@ -170,6 +207,9 @@ onBeforeUnmount(() => {
       </button>
     </section>
 
+    <div v-if="market === 'usdm' && exchange === 'binance'" class="notice-banner">
+      当前合约行情仍使用 Binance Global。若该网络返回 HTTP 451，切换到现货并选择 Coinbase 或 Binance.US；美国合规期货数据需要单独接入 Coinbase Derivatives 的 FIX/UDP 市场数据服务，不能用现货行情冒充永续合约。
+    </div>
     <div v-if="error" class="error-banner">{{ error }}</div>
     <div v-if="analysisError" class="error-banner">{{ analysisError }}</div>
 
@@ -177,7 +217,7 @@ onBeforeUnmount(() => {
       <article class="stat-card panel">
         <span class="stat-label">最新价格</span>
         <strong class="price-value">{{ formatNumber(ticker?.last_price) }}</strong>
-        <span class="stat-foot">{{ symbol }}</span>
+        <span class="stat-foot">{{ symbol }} · {{ exchangeLabel }}</span>
       </article>
       <article class="stat-card panel">
         <span class="stat-label">24 小时涨跌</span>
@@ -202,7 +242,7 @@ onBeforeUnmount(() => {
       <div class="panel-heading">
         <div>
           <h2>AI Price Action 分析</h2>
-          <p>{{ analysis.symbol }} · {{ analysis.market }} · {{ analysis.timeframe }} · {{ analysis.bar_count }} 根已收盘 K 线</p>
+          <p>{{ analysis.symbol }} · {{ analysis.exchange }} · {{ analysis.market }} · {{ analysis.timeframe }} · {{ analysis.bar_count }} 根已收盘 K 线</p>
         </div>
         <span :class="analysis.status === 'completed' ? 'data-badge' : 'coming-soon'">
           {{ analysis.status === "completed" ? "ANALYSIS COMPLETE" : "ANALYSIS FAILED" }}
@@ -239,7 +279,7 @@ onBeforeUnmount(() => {
         <div class="panel-heading">
           <div>
             <h2>{{ symbol }} <span class="muted">{{ market === "spot" ? "SPOT" : "USDⓈ-M" }}</span></h2>
-            <p>{{ interval }} · Binance · K 线数据</p>
+            <p>{{ interval }} · {{ exchangeLabel }} · K 线数据</p>
           </div>
           <span class="data-badge">REST MARKET DATA</span>
         </div>
@@ -253,17 +293,17 @@ onBeforeUnmount(() => {
 
       <aside class="side-column">
         <article class="panel info-panel">
-          <div class="panel-heading"><h2>分析模块</h2><span class="coming-soon">迭代中</span></div>
-          <div class="module-row"><span>Price Action Stage 1</span><b>已接入核心</b></div>
-          <div class="module-row"><span>Price Action Stage 2</span><b>已接入核心</b></div>
-          <div class="module-row"><span>合约资金费率 / OI</span><b>API 已建立</b></div>
-          <div class="module-row"><span>持续监控与机会提醒</span><b>后续阶段</b></div>
+          <div class="panel-heading"><h2>行情提供商</h2><span class="coming-soon">多源适配</span></div>
+          <div class="module-row"><span>Binance Global</span><b>现货 / USD-M</b></div>
+          <div class="module-row"><span>Binance.US</span><b>现货</b></div>
+          <div class="module-row"><span>Coinbase Exchange</span><b>现货</b></div>
+          <div class="module-row"><span>Coinbase Derivatives</span><b>FIX/UDP 待接入</b></div>
         </article>
         <article class="panel info-panel">
           <div class="panel-heading"><h2>24 小时成交</h2></div>
           <div class="metric-line"><span>基础资产成交量</span><strong>{{ formatNumber(ticker?.volume) }}</strong></div>
           <div class="metric-line"><span>计价资产成交额</span><strong>{{ formatNumber(ticker?.quote_volume) }}</strong></div>
-          <p class="notice">当前版本只读取 Binance 公共行情，不连接用户账户，不包含下单、撤单或资金操作。AI 分析需由服务器管理员配置并启用。</p>
+          <p class="notice">各交易所交易对和计价货币不同，例如 Coinbase 使用 BTC-USD，Binance 使用 BTCUSDT。不可将不同市场的 OHLCV 直接拼接。此版本仅读取公开行情，不连接账户或执行交易。</p>
         </article>
       </aside>
     </section>

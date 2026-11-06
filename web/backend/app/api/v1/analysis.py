@@ -11,6 +11,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.adapters.binance.client import BinanceAPIError
 from app.adapters.binance.models import MarketType
 from app.services.analysis_service import (
     AnalysisConfigurationError,
@@ -120,6 +121,17 @@ async def submit_analysis(payload: AnalysisRequest, request: Request):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except InsufficientMarketDataError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BinanceAPIError as exc:
+        if exc.status_code in (418, 429):
+            raise HTTPException(
+                status_code=503,
+                detail="Binance is rate-limiting this service; retry later",
+                headers={"Retry-After": exc.retry_after or "5"},
+            ) from exc
+        raise HTTPException(
+            status_code=502,
+            detail="Binance market data is temporarily unavailable",
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except HTTPException:
@@ -149,6 +161,6 @@ async def submit_analysis(payload: AnalysisRequest, request: Request):
 
 def _seconds_until_utc_midnight() -> int:
     now = datetime.now(timezone.utc)
-    tomorrow = (now.date().toordinal() + 1)
+    tomorrow = now.date().toordinal() + 1
     next_date = datetime.fromordinal(tomorrow).replace(tzinfo=timezone.utc)
     return max(1, int((next_date - now).total_seconds()))

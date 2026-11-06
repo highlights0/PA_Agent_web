@@ -30,7 +30,7 @@ def _validate_symbol(symbol: str) -> str:
     return normalized
 
 
-def _translate_error(exc: BinanceAPIError, exchange: str) -> HTTPException:
+def _translate_error(exc: BinanceAPIError, exchange: str = "Binance") -> HTTPException:
     if exc.status_code in (418, 429):
         return HTTPException(
             status_code=503,

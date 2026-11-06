@@ -12,10 +12,12 @@ class BinanceAPIError(Exception):
         message: str,
         *,
         status_code: int | None = None,
+        error_code: int | None = None,
         retry_after: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
         self.retry_after = retry_after
 
 
@@ -39,15 +41,22 @@ class BinanceRESTClient:
         if response.status_code >= 400:
             retry_after = response.headers.get("Retry-After")
             message = "Binance market-data request failed"
+            error_code = None
             try:
                 payload = response.json()
-                if isinstance(payload, dict) and payload.get("msg"):
-                    message = str(payload["msg"])[:300]
+                if isinstance(payload, dict):
+                    if payload.get("msg"):
+                        message = str(payload["msg"])[:240]
+                    raw_code = payload.get("code")
+                    if isinstance(raw_code, int):
+                        error_code = raw_code
             except ValueError:
+                # Do not expose arbitrary HTML/proxy response bodies to visitors.
                 pass
             raise BinanceAPIError(
                 message,
                 status_code=response.status_code,
+                error_code=error_code,
                 retry_after=retry_after,
             )
 

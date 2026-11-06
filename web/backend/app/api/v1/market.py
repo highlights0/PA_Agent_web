@@ -35,8 +35,32 @@ def _translate_error(exc: BinanceAPIError) -> HTTPException:
             detail="Binance is rate-limiting this service; retry later.",
             headers={"Retry-After": exc.retry_after or "5"},
         )
+    if exc.status_code == 451:
+        return HTTPException(
+            status_code=502,
+            detail=(
+                "Binance returned HTTP 451 (Unavailable For Legal Reasons). "
+                "The Binance global API may be restricted for this network region or IP. "
+                "Test the same endpoint from another permitted network or use a supported exchange."
+            ),
+        )
+    if exc.status_code == 403:
+        return HTTPException(
+            status_code=502,
+            detail=(
+                "Binance returned HTTP 403 (Forbidden). The request may be blocked by "
+                "Binance, a regional access rule, or an upstream security filter."
+            ),
+        )
     if exc.status_code is not None and 400 <= exc.status_code < 500:
-        return HTTPException(status_code=422, detail="Binance rejected the market-data request")
+        code = f", Binance code {exc.error_code}" if exc.error_code is not None else ""
+        message = str(exc)[:240]
+        return HTTPException(
+            status_code=502,
+            detail=f"Binance returned HTTP {exc.status_code}{code}: {message}",
+        )
+    if exc.status_code is None:
+        return HTTPException(status_code=502, detail=str(exc)[:240])
     return HTTPException(status_code=502, detail="Binance market-data service is unavailable")
 
 

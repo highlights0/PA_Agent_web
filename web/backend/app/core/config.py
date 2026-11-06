@@ -20,7 +20,7 @@ def _bool_env(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_env: str = os.getenv("APP_ENV", "development")
-    spot_rest_url: str = os.getenv("BINANCE_SPOT_REST_URL", "https://api.binance.com")
+    spot_rest_url: str = os.getenv("BINANCE_SPOT_REST_URL", "https://data-api.binance.vision")
     futures_rest_url: str = os.getenv("BINANCE_USDM_REST_URL", "https://fapi.binance.com")
     binance_us_spot_rest_url: str = os.getenv("BINANCE_US_SPOT_REST_URL", "https://api.binance.us")
     coinbase_spot_rest_url: str = os.getenv(

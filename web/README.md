@@ -11,7 +11,7 @@ Multi-exchange Web market-data and original PA analysis foundation.
 | Coinbase Exchange | Yes | Not offered by this adapter |
 | Coinbase Derivatives | Not applicable | FIX/UDP market-data integration is a separate future task |
 
-The API does not silently replace one exchange with another. Every response is associated with an explicitly selected exchange. Binance Global can still return HTTP 451 depending on the network region or IP. When that happens, use Coinbase Exchange or Binance.US for Spot if those services are available from the current network.
+The API does not silently replace one exchange with another. Every response is associated with an explicitly selected exchange. Binance Global Spot defaults to the official public market-data-only host https://data-api.binance.vision. This host supports public Spot market-data endpoints and is separate from the global trading API host. Binance Global Futures still uses https://fapi.binance.com and may remain region-restricted. When another Spot provider is needed, use Coinbase Exchange or Binance.US if those services are available from the current network.
 
 Coinbase Exchange uses BASE-QUOTE symbols such as BTC-USD and ETH-USD. Binance uses symbols such as BTCUSDT. These are different markets and quote currencies; do not concatenate their candles into one time series or treat USD and USDT as identical.
 

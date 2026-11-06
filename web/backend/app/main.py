@@ -1,6 +1,7 @@
-"""FastAPI application for PA Crypto Agent's public market-data API."""
+"""FastAPI application for PA Crypto Agent's public market-data and analysis APIs."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import httpx
@@ -10,8 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.adapters.binance.client import BinanceAPIError, BinanceRESTClient
 from app.adapters.binance.futures_rest import BinanceUSDMREST
 from app.adapters.binance.spot_rest import BinanceSpotREST
+from app.api.v1.analysis import router as analysis_router
 from app.api.v1.market import router as market_router
 from app.core.config import settings
+from app.core.public_quota import PublicAnalysisQuota
 from app.services.market_service import MarketService
 
 
@@ -28,9 +31,11 @@ async def lifespan(app: FastAPI):
     app.state.http = http
     app.state.settings = settings
     app.state.market_service = market_service
-    # This service is wired internally for the next API phase. It is not exposed
-    # as an unauthenticated public endpoint until guest quotas and job isolation land.
     app.state.analysis_service = AnalysisService(market_service, settings)
+    app.state.analysis_quota = PublicAnalysisQuota(settings.public_analysis_per_ip_daily)
+    app.state.analysis_semaphore = asyncio.Semaphore(
+        max(1, settings.public_max_concurrent_analyses)
+    )
     try:
         yield
     finally:
@@ -39,15 +44,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PA Crypto Agent API",
-    version="0.2.0",
-    description="Public Binance Spot and USDⓈ-M Futures market-data API. No trading endpoints.",
+    version="0.3.0",
+    description="Binance Spot and USDⓈ-M Futures market data plus guarded PA analysis. No trading endpoints.",
     lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
     allow_credentials=True,
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
 
@@ -73,3 +78,4 @@ async def binance_error_handler(request, exc: BinanceAPIError):
 
 
 app.include_router(market_router, prefix="/api/v1")
+app.include_router(analysis_router, prefix="/api/v1")

@@ -26,8 +26,30 @@ export interface Ticker {
   quote_volume: string;
 }
 
-async function request<T>(path: string): Promise<T> {
-  const response = await fetch(path, { headers: { Accept: "application/json" } });
+export interface AnalysisResult {
+  analysis_id: string;
+  status: "completed" | "failed";
+  market: Market;
+  symbol: string;
+  timeframe: string;
+  bar_count: number;
+  events: string[];
+  stage1_diagnosis: Record<string, any> | null;
+  stage2_decision: Record<string, any> | null;
+  usage: Record<string, number>;
+  error: Record<string, any> | null;
+  quota_remaining: number;
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...init,
+    headers: {
+      Accept: "application/json",
+      ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...init?.headers,
+    },
+  });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || "请求失败 (" + response.status + ")");
@@ -43,4 +65,14 @@ export const api = {
     ),
   ticker: (market: Market, symbol: string) =>
     request<Ticker>("/api/v1/market/" + market + "/" + encodeURIComponent(symbol) + "/ticker"),
+  analyze: (market: Market, symbol: string, timeframe: string, analysisBars = 100) =>
+    request<AnalysisResult>("/api/v1/analysis", {
+      method: "POST",
+      body: JSON.stringify({
+        market,
+        symbol,
+        timeframe,
+        analysis_bars: analysisBars,
+      }),
+    }),
 };

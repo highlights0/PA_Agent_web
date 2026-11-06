@@ -33,6 +33,9 @@ class Settings:
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
     ai_thinking: bool = _bool_env("AI_THINKING", True)
     ai_reasoning_effort: str = os.getenv("AI_REASONING_EFFORT", "medium")
+    public_analysis_enabled: bool = _bool_env("PUBLIC_ANALYSIS_ENABLED", False)
+    public_analysis_per_ip_daily: int = int(os.getenv("PUBLIC_ANALYSIS_PER_IP_DAILY", "5"))
+    public_max_concurrent_analyses: int = int(os.getenv("PUBLIC_MAX_CONCURRENT_ANALYSES", "1"))
 
 
 settings = Settings()

@@ -52,3 +52,8 @@ The Web adapter normalizes Binance REST responses into DTOs and can convert clos
 ### Current implementation scope
 
 This first commit establishes P0 audit + P1 REST market-data foundation + a basic Vue market screen. It does not yet claim that the original AI analysis pipeline, persistent monitoring workers, PostgreSQL/Redis, guest quotas, or opportunity lifecycle are production-ready. Those are follow-on phases.
+
+
+### Linux import boundary correction
+
+The first Web CI run exposed one additional desktop side effect: importing any pa_agent.util submodule executes pa_agent/util/__init__.py, which eagerly imported EventBus and therefore PyQt6. The package initializer now uses lazy exports so pure analysis utilities can be imported without loading Qt. Desktop callers that explicitly request EventBus or logging helpers retain the same public import names. A subprocess regression test verifies that importing pa_agent.util.price_tick does not import PyQt6.

@@ -15,18 +15,35 @@ This directory contains the Web implementation for the PA_Agent fork.
 
 Backend (run from repository root):
 
-~~~bash
+~~~cmd
 python -m venv .venv
-source .venv/bin/activate
-pip install -e . --no-deps
-pip install -r web/backend/requirements.txt
-PYTHONPATH=web/backend uvicorn app.main:app --reload --app-dir web/backend
+.venv\Scripts\activate.bat
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e . --no-deps
+python -m pip install -r web/backend/requirements.txt
+set PYTHONPATH=web\backend
+python -m uvicorn app.main:app --app-dir web\backend --reload
 ~~~
+
+If pip reports a dependency-resolution error for OpenAI/jiter, first check whether a private or stale package mirror is configured:
+
+~~~cmd
+python -m pip config list
+python -m pip index versions jiter
+~~~
+
+Then retry against the official PyPI index:
+
+~~~cmd
+python -m pip install -i https://pypi.org/simple -r web/backend/requirements.txt
+~~~
+
+The Web requirements intentionally constrain the OpenAI SDK to the 1.x API line used by the existing PA client and declare its jiter dependency explicitly. This avoids accidentally selecting a future major SDK release. If the resolver still fails, capture the complete output including the final conflicting-package lines; do not randomly downgrade unrelated packages.
 
 Frontend:
 
-~~~bash
-cd web/frontend
+~~~cmd
+cd web\frontend
 npm install
 npm run dev
 ~~~

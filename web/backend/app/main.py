@@ -22,9 +22,15 @@ async def lifespan(app: FastAPI):
     http = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
     spot = BinanceSpotREST(BinanceRESTClient(http, settings.spot_rest_url))
     futures = BinanceUSDMREST(BinanceRESTClient(http, settings.futures_rest_url))
+    market_service = MarketService(spot, futures)
+    from app.services.analysis_service import AnalysisService
+
     app.state.http = http
     app.state.settings = settings
-    app.state.market_service = MarketService(spot, futures)
+    app.state.market_service = market_service
+    # This service is wired internally for the next API phase. It is not exposed
+    # as an unauthenticated public endpoint until guest quotas and job isolation land.
+    app.state.analysis_service = AnalysisService(market_service, settings)
     try:
         yield
     finally:
@@ -33,7 +39,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PA Crypto Agent API",
-    version="0.1.0",
+    version="0.2.0",
     description="Public Binance Spot and USDⓈ-M Futures market-data API. No trading endpoints.",
     lifespan=lifespan,
 )

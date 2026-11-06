@@ -10,3 +10,4 @@ openai>=1.40
 tiktoken>=0.7
 jsonschema>=4.22
 pydantic>=2.7
+cryptography>=42

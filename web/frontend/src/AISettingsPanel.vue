@@ -197,7 +197,7 @@ async function saveProvider() {
     clearApiKey.value = false;
     clearBackupKey.value = false;
     testResult.value = null;
-    notice.value = "配置已加密保存。" + (saved?.active ? " 当前模型已启用。" : "");
+    notice.value = "配置已加密保存。" + (result.active_provider_id === selectedId.value ? " 当前模型已启用。" : "");
     emit("saved");
     await loadProviders();
   } catch (err) {

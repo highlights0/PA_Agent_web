@@ -252,6 +252,11 @@ class AIProviderStore:
                 if not item.get("api_key_encrypted"):
                     raise ValueError("请先配置 API Key，才能设为当前使用模型")
                 data["active_provider_id"] = item["id"]
+            elif (
+                clear_api_key
+                and data.get("active_provider_id") == item["id"]
+            ):
+                data["active_provider_id"] = None
             elif data.get("active_provider_id") is None and item.get("api_key_encrypted"):
                 data["active_provider_id"] = item["id"]
 

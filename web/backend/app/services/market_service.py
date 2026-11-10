@@ -234,9 +234,9 @@ class MarketService:
     async def _gate_futures_context(
         self, symbol: str, requested_interval: str = "5m"
     ) -> FuturesContextDTO:
-        stats_interval = requested_interval if requested_interval in {
-            "5m", "15m", "30m", "1h", "4h", "8h", "1d"
-        } else "5m"
+        # Keep the Gate liquidation/OI aggregation on a fixed 5m cadence:
+        # 37 points span approximately three hours and match the *_3h field names.
+        stats_interval = "5m"
         tasks = {
             "contract": self._gate_futures.contract_info(symbol),
             "ticker": self._gate_futures.ticker_24h(symbol),

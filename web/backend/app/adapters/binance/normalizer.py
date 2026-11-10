@@ -15,6 +15,7 @@ _INTERVAL_MS = {
     "12h": 43_200_000, "1d": 86_400_000, "3d": 259_200_000,
     "1w": 604_800_000, "7d": 604_800_000,
 }
+_GATE_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"}
 
 
 def _decimal_string(value: Any, field: str) -> str:
@@ -97,7 +98,7 @@ def normalize_coinbase_klines(
                 close=_decimal_string(close_price, "close"),
                 volume=_decimal_string(volume, "volume"),
                 quote_volume="",
-                trades=0,
+                trades=None,
                 taker_buy_base_volume="",
                 taker_buy_quote_volume="",
                 closed=close_time < now,
@@ -117,7 +118,7 @@ def normalize_gate_klines(
     now_ms: int | None = None,
 ) -> list[KlineDTO]:
     """Gate candles use contract volume v and quote turnover sum; convert v to base volume."""
-    if interval not in _INTERVAL_MS:
+    if interval not in _GATE_INTERVALS:
         raise ValueError(f"Unsupported Gate candle interval: {interval}")
     multiplier = Decimal(_decimal_string(quanto_multiplier, "quanto_multiplier"))
     if multiplier <= 0:
@@ -150,7 +151,7 @@ def normalize_gate_klines(
                 close=_decimal_string(row.get("c"), "close"),
                 volume=format(base_volume, "f"),
                 quote_volume=_decimal_string(row.get("sum"), "quote_volume") if row.get("sum") is not None else "",
-                trades=0,
+                trades=None,
                 taker_buy_base_volume="",
                 taker_buy_quote_volume="",
                 closed=close_time < now,

@@ -30,7 +30,7 @@ class KlineDTO(BaseModel):
     close: str
     volume: str
     quote_volume: str
-    trades: int
+    trades: int | None
     taker_buy_base_volume: str
     taker_buy_quote_volume: str
     closed: bool

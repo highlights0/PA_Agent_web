@@ -22,6 +22,8 @@ def test_gate_candles_convert_contract_volume_to_base_asset_volume():
     assert result[0].volume == "0.010"
     assert result[0].contract_volume == "10"
     assert result[0].quote_volume == "1010"
+    assert result[0].trades is None
+    assert result[0].taker_buy_base_volume == ""
     assert result[0].exchange == "gate"
     assert result[0].market_type == "usdm"
     assert result[0].closed is True

@@ -11,7 +11,7 @@ export interface Kline {
   close: string;
   volume: string;
   quote_volume: string;
-  trades: number;
+  trades: number | null;
   taker_buy_base_volume: string;
   taker_buy_quote_volume: string;
   closed: boolean;

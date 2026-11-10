@@ -225,17 +225,17 @@ class AIProviderStore:
             else:
                 item = existing
 
-            if clear_api_key:
-                item["api_key_encrypted"] = ""
-            elif api_key and api_key.strip():
+            if api_key and api_key.strip():
                 item["api_key_encrypted"] = self._encrypt(api_key.strip())
+            elif clear_api_key:
+                item["api_key_encrypted"] = ""
 
-            if clear_backup_glm_api_key:
-                item["backup_glm_api_key_encrypted"] = ""
-            elif backup_glm_api_key and backup_glm_api_key.strip():
+            if backup_glm_api_key and backup_glm_api_key.strip():
                 item["backup_glm_api_key_encrypted"] = self._encrypt(
                     backup_glm_api_key.strip()
                 )
+            elif clear_backup_glm_api_key:
+                item["backup_glm_api_key_encrypted"] = ""
 
             item.update(
                 {

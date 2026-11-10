@@ -217,3 +217,18 @@ def test_generated_encryption_key_survives_store_recreation(tmp_path):
     active = second.get_decrypted()
     assert active is not None
     assert active["api_key"] == "sk-test-secret-123456"
+
+
+def test_entering_replacement_key_overrides_clear_checkbox(tmp_path):
+    store = AIProviderStore(tmp_path / "ai_providers.json", master_key=Fernet.generate_key())
+    _save(store)
+    provider_id = store.list_public()["providers"][0]["id"]
+
+    _save(
+        store,
+        provider_id=provider_id,
+        api_key="sk-new-replacement-9876",
+        clear_api_key=True,
+        activate=True,
+    )
+    assert store.get_decrypted(provider_id)["api_key"] == "sk-new-replacement-9876"

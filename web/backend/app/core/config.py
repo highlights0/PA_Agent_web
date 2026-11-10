@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 def _csv_env(name: str, default: str) -> tuple[str, ...]:
@@ -40,6 +41,12 @@ class Settings:
     ai_model: str = os.getenv("AI_MODEL", "deepseek-chat")
     ai_thinking: bool = _bool_env("AI_THINKING", True)
     ai_reasoning_effort: str = os.getenv("AI_REASONING_EFFORT", "medium")
+    ai_provider_store_path: str = os.getenv(
+        "AI_PROVIDER_STORE_PATH",
+        str(Path(__file__).resolve().parents[2] / "data" / "ai_providers.json"),
+    )
+    ai_settings_master_key: str = os.getenv("AI_SETTINGS_MASTER_KEY", "")
+    ai_settings_admin_token: str = os.getenv("AI_SETTINGS_ADMIN_TOKEN", "")
     public_analysis_enabled: bool = _bool_env("PUBLIC_ANALYSIS_ENABLED", False)
     public_analysis_per_ip_daily: int = int(os.getenv("PUBLIC_ANALYSIS_PER_IP_DAILY", "5"))
     public_max_concurrent_analyses: int = int(os.getenv("PUBLIC_MAX_CONCURRENT_ANALYSES", "1"))

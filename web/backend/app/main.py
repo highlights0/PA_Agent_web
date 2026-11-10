@@ -15,9 +15,11 @@ from app.adapters.binance_us.spot_rest import BinanceUSSpotREST
 from app.adapters.coinbase.spot_rest import CoinbaseSpotREST
 from app.adapters.gate.futures_rest import GateFuturesREST
 from app.api.v1.analysis import router as analysis_router
+from app.api.v1.ai_settings import router as ai_settings_router
 from app.api.v1.market import router as market_router
 from app.core.config import settings
 from app.core.public_quota import PublicAnalysisQuota
+from app.services.ai_provider_store import AIProviderStore
 from app.services.market_service import MarketService
 from app.services.provider_registry import ProviderRegistry
 
@@ -52,13 +54,20 @@ async def lifespan(app: FastAPI):
         gate_futures=gate_futures,
     )
     market_service = MarketService(providers, binance_futures, gate_futures)
+    ai_provider_store = AIProviderStore(
+        settings.ai_provider_store_path,
+        master_key=settings.ai_settings_master_key or None,
+    )
 
     from app.services.analysis_service import AnalysisService
 
     app.state.http = http
     app.state.settings = settings
     app.state.market_service = market_service
-    app.state.analysis_service = AnalysisService(market_service, settings)
+    app.state.ai_provider_store = ai_provider_store
+    app.state.analysis_service = AnalysisService(
+        market_service, settings, ai_provider_store
+    )
     app.state.analysis_quota = PublicAnalysisQuota(settings.public_analysis_per_ip_daily)
     app.state.analysis_semaphore = asyncio.Semaphore(
         max(1, settings.public_max_concurrent_analyses)
@@ -73,8 +82,8 @@ app = FastAPI(
     title="PA Crypto Agent API",
     version="0.5.0",
     description=(
-        "Multi-exchange public crypto market data: Binance, Binance.US, Coinbase Spot, "
-        "and Gate.io USDT perpetual futures. No trading endpoints."
+        "Multi-exchange public crypto market data with browser-managed encrypted AI provider "
+        "settings and the original PA two-stage analysis core. No trading endpoints."
     ),
     lifespan=lifespan,
 )
@@ -82,8 +91,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-PA-Admin-Token"],
 )
 
 
@@ -109,3 +118,4 @@ async def binance_error_handler(request, exc: BinanceAPIError):
 
 app.include_router(market_router, prefix="/api/v1")
 app.include_router(analysis_router, prefix="/api/v1")
+app.include_router(ai_settings_router, prefix="/api/v1")

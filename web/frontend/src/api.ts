@@ -79,6 +79,55 @@ export interface AnalysisResult {
   quota_remaining: number;
 }
 
+
+export interface AIProviderPublic {
+  id: string;
+  name: string;
+  base_url: string;
+  model: string;
+  thinking: boolean;
+  reasoning_effort: "low" | "medium" | "high" | "max";
+  context_window: number;
+  has_api_key: boolean;
+  api_key_masked: string;
+  has_backup_glm_api_key: boolean;
+  backup_glm_api_key_masked: string;
+  active: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface AIProviderList {
+  providers: AIProviderPublic[];
+  active_provider_id: string | null;
+  saved_provider_id?: string;
+  encryption: string;
+}
+
+export interface AIProviderInput {
+  id?: string | null;
+  name: string;
+  base_url: string;
+  model: string;
+  api_key?: string | null;
+  clear_api_key?: boolean;
+  backup_glm_api_key?: string | null;
+  clear_backup_glm_api_key?: boolean;
+  thinking: boolean;
+  reasoning_effort: "low" | "medium" | "high" | "max";
+  context_window: number;
+  activate: boolean;
+}
+
+export interface AIProviderTestResult {
+  ok: boolean;
+  model: string;
+  latency_ms: number;
+  response_preview?: string;
+  total_tokens?: number | null;
+  error?: string;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -120,5 +169,34 @@ export const api = {
         timeframe,
         analysis_bars: analysisBars,
       }),
+    }),
+  aiProviders: (adminToken = "") =>
+    request<AIProviderList>("/api/v1/ai/providers", {
+      headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},
+    }),
+  saveAIProvider: (payload: AIProviderInput, adminToken = "") =>
+    request<AIProviderList>("/api/v1/ai/providers", {
+      method: "POST",
+      headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},
+      body: JSON.stringify(payload),
+    }),
+  activateAIProvider: (id: string, adminToken = "") =>
+    request<AIProviderList>("/api/v1/ai/providers/" + encodeURIComponent(id) + "/activate", {
+      method: "POST",
+      headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},
+    }),
+  deleteAIProvider: (id: string, adminToken = "") =>
+    request<AIProviderList>("/api/v1/ai/providers/" + encodeURIComponent(id), {
+      method: "DELETE",
+      headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},
+    }),
+  testAIProvider: (
+    payload: { id?: string | null; base_url: string; model: string; api_key?: string | null },
+    adminToken = "",
+  ) =>
+    request<AIProviderTestResult>("/api/v1/ai/providers/test", {
+      method: "POST",
+      headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},
+      body: JSON.stringify(payload),
     }),
 };

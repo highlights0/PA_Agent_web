@@ -11,6 +11,7 @@ import {
   type Market,
   type Ticker,
 } from "./api";
+import AISettingsPanel from "./AISettingsPanel.vue";
 
 const market = ref<Market>("spot");
 const exchange = ref<Exchange>("coinbase");
@@ -26,6 +27,7 @@ const analysisLoading = ref(false);
 const error = ref("");
 const contextError = ref("");
 const analysisError = ref("");
+const showAiSettings = ref(false);
 const chartHost = ref<HTMLDivElement | null>(null);
 let chart: IChartApi | null = null;
 let candleSeries: ISeriesApi<"Candlestick"> | null = null;
@@ -234,7 +236,12 @@ onBeforeUnmount(() => {
           <div class="brand-subtitle">PRICE ACTION MARKET WORKSPACE</div>
         </div>
       </div>
-      <div class="connection"><span class="live-dot"></span> 多交易所公开行情</div>
+      <div class="topbar-actions">
+        <div class="connection"><span class="live-dot"></span> 多交易所公开行情</div>
+        <button class="settings-button" @click="showAiSettings = true">
+          <span>⚙</span> AI 模型设置
+        </button>
+      </div>
     </header>
 
     <section class="page-heading">
@@ -458,5 +465,10 @@ onBeforeUnmount(() => {
     </section>
 
     <footer>PA Crypto Agent · Public market data · Not investment advice</footer>
+    <AISettingsPanel
+      v-if="showAiSettings"
+      @close="showAiSettings = false"
+      @saved="analysis = null"
+    />
   </main>
 </template>

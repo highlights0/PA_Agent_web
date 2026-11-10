@@ -53,11 +53,30 @@ Official Gate API documentation: [Futures REST API](https://www.gate.com/docs/de
 
 The Gate context endpoint returns funding rate, funding interval/next funding time, mark/index price, OI in contracts and quote currency, OI window change, account/taker/top-trader ratios, and aggregate long/short liquidation amounts. Missing fields are null and described in `data_quality`; they are never filled with zero or another exchange's values.
 
-## Original PA analysis
+## Browser AI model settings
 
-The Web analysis service still calls the original `KlineFrame`, `PromptAssembler`, `JsonValidator`, and `TwoStageOrchestrator`. For Gate futures it supplies Gate USDT perpetual candles plus a source-attributed Gate derivatives context. It does not mix spot candles or Binance statistics into the Gate contract analysis.
+Open the Web app at http://localhost:5173 and click **AI 模型设置** in the top-right corner. The browser settings reproduce the original desktop PA Agent provider fields:
 
-Public AI analysis remains disabled by default and requires a server-side AI key plus an explicit operator opt-in. The current quota is an in-memory per-IP UTC-day counter and is suitable only for single-process staging, not a multi-replica public launch.
+- Profile name, Model, API Base URL, API Key
+- Optional GLM backup API Key
+- Thinking on/off
+- Reasoning Effort: low / medium / high / max
+- Context Window
+- Test connection, save, switch active model, and delete saved profiles
+
+Multiple provider profiles can be saved; the active profile is used by both stages of the original PA analysis. Existing `AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL` environment variables remain as a backward-compatible fallback if no Web profile is active.
+
+### Key protection and access
+
+- API keys are encrypted at rest with Fernet. Plaintext keys are only decrypted in the backend process for an AI request; list/save responses only return a masked key and configured status.
+- By default, the encryption key is generated once at `web/backend/data/ai_settings.key`; encrypted profiles are stored in `web/backend/data/ai_providers.json`. This directory is gitignored.
+- Back up both files together. If the encryption key is lost, saved API keys cannot be recovered. Never commit or share them.
+- For local development (`APP_ENV=development`), settings management is allowed only for loopback requests. The Vite dev server binds to 127.0.0.1.
+- For a server deployment, set `APP_ENV=production` and configure a long random `AI_SETTINGS_ADMIN_TOKEN`. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Enter that token in the browser settings panel; it is kept in sessionStorage for the current tab only.
+- `AI_SETTINGS_MASTER_KEY` is optional. If omitted, the backend generates `ai_settings.key` automatically. If supplied, it must be a Fernet URL-safe base64 key; generate one with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Keep it stable across restarts.
+- For Docker, the `pa-agent-data` named volume persists encrypted profiles and the generated encryption key. Back up that volume. Alternatively store `AI_SETTINGS_MASTER_KEY` in a secure secret manager. Losing both the saved key file and master key makes encrypted provider keys unrecoverable.
+- Public AI analysis remains disabled by default in production; set `PUBLIC_ANALYSIS_ENABLED=true` only after protecting the service and setting suitable quotas. In local development, saving an active AI profile enables analysis automatically.
+- The current quota is an in-memory per-IP UTC-day counter and is suitable only for single-process staging, not a multi-replica public launch.
 
 No exchange account access, order, cancel, transfer, or withdrawal endpoints are implemented.
 

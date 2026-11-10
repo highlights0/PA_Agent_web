@@ -45,6 +45,18 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _analysis_enabled(request: Request) -> bool:
+    config = request.app.state.settings
+    if config.public_analysis_enabled:
+        return True
+    if config.app_env.lower() == "development":
+        return (
+            request.app.state.ai_provider_store.has_active_key()
+            or bool(config.ai_api_key.strip())
+        )
+    return False
+
+
 def _safe_error(record_exception: object) -> dict | None:
     if not isinstance(record_exception, dict):
         return None
@@ -62,7 +74,7 @@ def _safe_error(record_exception: object) -> dict | None:
 async def analysis_quota(request: Request):
     ip = _client_ip(request)
     return {
-        "enabled": request.app.state.settings.public_analysis_enabled,
+        "enabled": _analysis_enabled(request),
         "daily_limit": request.app.state.settings.public_analysis_per_ip_daily,
         "remaining": request.app.state.analysis_quota.remaining(ip),
         "scope": "per_ip_utc_day_in_process",
@@ -72,14 +84,11 @@ async def analysis_quota(request: Request):
 @router.post("/analysis")
 async def submit_analysis(payload: AnalysisRequest, request: Request):
     config = request.app.state.settings
-    if not config.public_analysis_enabled:
+    if not _analysis_enabled(request):
         raise HTTPException(
             status_code=503,
             detail="Public AI analysis is disabled by the server operator",
         )
-    if not config.ai_api_key.strip():
-        raise HTTPException(status_code=503, detail="AI service is not configured")
-
     symbol = payload.symbol.strip().upper()
     if not _SYMBOL_RE.fullmatch(symbol):
         raise HTTPException(status_code=422, detail="Invalid symbol")

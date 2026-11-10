@@ -54,9 +54,44 @@ def _context_period(timeframe: str) -> str:
 class AnalysisService:
     """Builds canonical KlineFrame input and runs a fresh orchestrator per request."""
 
-    def __init__(self, market_service: Any, web_settings: WebSettings) -> None:
+    def __init__(
+        self,
+        market_service: Any,
+        web_settings: WebSettings,
+        provider_store: Any | None = None,
+    ) -> None:
         self._market = market_service
         self._web_settings = web_settings
+        self._provider_store = provider_store
+
+    def _active_provider(self) -> dict[str, Any]:
+        if self._provider_store is not None:
+            saved = self._provider_store.get_decrypted()
+            if saved and saved.get("api_key"):
+                return {
+                    "model": saved["model"],
+                    "base_url": saved["base_url"],
+                    "api_key": saved["api_key"],
+                    "thinking": saved.get("thinking", True),
+                    "reasoning_effort": saved.get("reasoning_effort", "medium"),
+                    "context_window": saved.get("context_window", 200000),
+                    "backup_glm_api_key": saved.get("backup_glm_api_key", ""),
+                }
+
+        # Backward compatibility for operators who still configure the legacy env vars.
+        if self._web_settings.ai_api_key.strip():
+            return {
+                "model": self._web_settings.ai_model,
+                "base_url": self._web_settings.ai_base_url,
+                "api_key": self._web_settings.ai_api_key,
+                "thinking": self._web_settings.ai_thinking,
+                "reasoning_effort": self._web_settings.ai_reasoning_effort,
+                "context_window": 200000,
+                "backup_glm_api_key": "",
+            }
+        raise AnalysisConfigurationError(
+            "尚未配置 AI 模型。请打开网页右上角「AI 模型设置」，添加 API Base URL、模型和 API Key。"
+        )
 
     async def analyze(
         self,
@@ -66,8 +101,7 @@ class AnalysisService:
         analysis_bars: int = 100,
         exchange: str = "binance",
     ) -> AnalysisRun:
-        if not self._web_settings.ai_api_key.strip():
-            raise AnalysisConfigurationError("AI_API_KEY is not configured on the server")
+        provider_config = self._active_provider()
         if analysis_bars < 20 or analysis_bars + 50 > self._web_settings.max_klines:
             raise ValueError("analysis_bars must be between 20 and server max bars minus 50")
         if market == "usdm" and exchange not in {"binance", "gate"}:
@@ -119,9 +153,16 @@ class AnalysisService:
                 },
             )
 
-        return await asyncio.to_thread(self._run_sync, frame, context)
+        return await asyncio.to_thread(
+            self._run_sync, frame, context, provider_config
+        )
 
-    def _run_sync(self, frame: Any, context: CryptoMarketContext) -> AnalysisRun:
+    def _run_sync(
+        self,
+        frame: Any,
+        context: CryptoMarketContext,
+        provider_config: dict[str, Any],
+    ) -> AnalysisRun:
         """Construct isolated settings/client/orchestrator state for one request."""
         from pa_agent.ai.deepseek_client import DeepSeekClient
         from pa_agent.ai.json_validator import JsonValidator
@@ -134,13 +175,19 @@ class AnalysisService:
 
         settings = Settings(
             provider=AIProviderSettings(
-                model=self._web_settings.ai_model,
-                base_url=self._web_settings.ai_base_url,
-                api_key=self._web_settings.ai_api_key,
-                thinking=self._web_settings.ai_thinking,
-                reasoning_effort=self._web_settings.ai_reasoning_effort,
+                model=provider_config["model"],
+                base_url=provider_config["base_url"],
+                api_key=provider_config["api_key"],
+                thinking=provider_config["thinking"],
+                reasoning_effort=provider_config["reasoning_effort"],
+                context_window=provider_config.get("context_window", 200000),
+                backup_glm_api_key=provider_config.get("backup_glm_api_key", ""),
             )
         )
+        if settings.provider.backup_glm_api_key:
+            from pa_agent.ai.glm_backup import ensure_glm_fallback
+
+            ensure_glm_fallback(settings.provider)
         settings.general.decision_stance = "conservative"
         settings.prompt.experience_max_entries = 0
 

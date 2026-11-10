@@ -21,10 +21,10 @@ from app.services.provider_registry import UnsupportedMarketProvider
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-_SYMBOL_RE = re.compile(r"^[A-Z0-9-]{3,24}$")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9_-]{3,32}$")
 _TIMEFRAMES = {
     "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h",
-    "8h", "12h", "1d", "3d", "1w", "1M",
+    "8h", "12h", "1d", "3d", "1w", "1M", "7d",
 }
 
 
@@ -32,8 +32,8 @@ class AnalysisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     market: MarketType
-    exchange: Literal["binance", "binance_us", "coinbase"] = "binance"
-    symbol: str = Field(min_length=3, max_length=24)
+    exchange: Literal["binance", "binance_us", "coinbase", "gate"] = "binance"
+    symbol: str = Field(min_length=3, max_length=32)
     timeframe: str = "15m"
     analysis_bars: int = Field(default=100, ge=20, le=250)
 

@@ -1,7 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ColorType, createChart, type IChartApi, type ISeriesApi } from "lightweight-charts";
-import { api, type AnalysisResult, type Exchange, type Kline, type Market, type Ticker } from "./api";
+import {
+  api,
+  type AnalysisResult,
+  type Exchange,
+  type FuturesContext,
+  type FuturesExchange,
+  type Kline,
+  type Market,
+  type Ticker,
+} from "./api";
 
 const market = ref<Market>("spot");
 const exchange = ref<Exchange>("coinbase");
@@ -9,24 +18,29 @@ const symbol = ref("BTC-USD");
 const interval = ref("15m");
 const klines = ref<Kline[]>([]);
 const ticker = ref<Ticker | null>(null);
+const futuresContext = ref<FuturesContext | null>(null);
 const analysis = ref<AnalysisResult | null>(null);
 const loading = ref(false);
+const contextLoading = ref(false);
 const analysisLoading = ref(false);
 const error = ref("");
+const contextError = ref("");
 const analysisError = ref("");
 const chartHost = ref<HTMLDivElement | null>(null);
 let chart: IChartApi | null = null;
 let candleSeries: ISeriesApi<"Candlestick"> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let refreshTimer: number | undefined;
+let contextTimer: number | undefined;
 
 const changePositive = computed(() => Number(ticker.value?.price_change_percent ?? 0) >= 0);
 const diagnosis = computed<Record<string, any>>(() => analysis.value?.stage1_diagnosis ?? {});
 const decision = computed<Record<string, any>>(() => analysis.value?.stage2_decision?.decision ?? {});
 const exchangeLabel = computed(() => ({
-  binance: "Binance Global",
-  binance_us: "Binance.US",
-  coinbase: "Coinbase Exchange",
+  binance: market.value === "usdm" ? "Binance Global USD-M" : "Binance Global Spot",
+  binance_us: "Binance.US Spot",
+  coinbase: "Coinbase Exchange Spot",
+  gate: "Gate.io USDT Perpetual",
 }[exchange.value]));
 
 function createMarketChart() {
@@ -60,7 +74,7 @@ async function loadMarket() {
   error.value = "";
   try {
     const normalized = symbol.value.trim().toUpperCase();
-    if (!/^[A-Z0-9-]{3,24}$/.test(normalized)) throw new Error("交易对格式不正确");
+    if (!/^[A-Z0-9_-]{3,32}$/.test(normalized)) throw new Error("交易对格式不正确");
     symbol.value = normalized;
     const [bars, quote] = await Promise.all([
       api.klines(market.value, exchange.value, normalized, interval.value, 200),
@@ -89,6 +103,28 @@ async function loadMarket() {
   }
 }
 
+async function loadFuturesContext() {
+  if (market.value !== "usdm" || !["gate", "binance"].includes(exchange.value)) {
+    futuresContext.value = null;
+    contextError.value = "";
+    return;
+  }
+  contextLoading.value = true;
+  contextError.value = "";
+  try {
+    futuresContext.value = await api.futuresContext(
+      exchange.value as FuturesExchange,
+      symbol.value.trim().toUpperCase(),
+      "5m",
+    );
+  } catch (err) {
+    futuresContext.value = null;
+    contextError.value = err instanceof Error ? err.message : "合约统计数据加载失败";
+  } finally {
+    contextLoading.value = false;
+  }
+}
+
 async function runAnalysis() {
   analysisLoading.value = true;
   analysisError.value = "";
@@ -107,29 +143,65 @@ async function runAnalysis() {
   }
 }
 
+function queryMarket() {
+  void loadMarket();
+  void loadFuturesContext();
+}
+
 function onMarketChange() {
   analysis.value = null;
+  futuresContext.value = null;
   if (market.value === "usdm") {
-    exchange.value = "binance";
+    exchange.value = "gate";
     if (symbol.value.includes("-")) symbol.value = "BTCUSDT";
-  } else if (exchange.value === "binance") {
-    exchange.value = "coinbase";
-    if (!symbol.value.includes("-")) symbol.value = "BTC-USD";
+    if (symbol.value.includes("_")) symbol.value = symbol.value.replace("_", "");
+  } else {
+    if (exchange.value === "gate" || exchange.value === "binance") {
+      exchange.value = "coinbase";
+      symbol.value = "BTC-USD";
+    } else if (!symbol.value.includes("-")) {
+      symbol.value = "BTCUSDT";
+    }
   }
-  void loadMarket();
+  queryMarket();
 }
 
 function onExchangeChange() {
   analysis.value = null;
-  if (market.value === "usdm") market.value = "spot";
-  if (exchange.value === "coinbase" && !symbol.value.includes("-")) symbol.value = "BTC-USD";
-  if (exchange.value !== "coinbase" && symbol.value.includes("-")) symbol.value = "BTCUSDT";
-  void loadMarket();
+  futuresContext.value = null;
+  if (market.value === "usdm") {
+    if (symbol.value.includes("-")) symbol.value = "BTCUSDT";
+    if (symbol.value.includes("_")) symbol.value = symbol.value.replace("_", "");
+  } else if (exchange.value === "coinbase") {
+    if (!symbol.value.includes("-")) symbol.value = "BTC-USD";
+  } else if (symbol.value.includes("-")) {
+    symbol.value = "BTCUSDT";
+  }
+  queryMarket();
 }
 
-function formatNumber(value: string | undefined) {
+function formatNumber(value: string | undefined | null) {
+  if (value === undefined || value === null || value === "") return "--";
+  const number = Number(value);
+  return Number.isFinite(number)
+    ? number.toLocaleString("en-US", { maximumFractionDigits: 6 })
+    : "--";
+}
+
+function formatFundingRate(value: string | undefined | null) {
+  if (value === undefined || value === null || value === "") return "--";
+  const number = Number(value);
+  return Number.isFinite(number) ? (number * 100).toFixed(4) + "%" : "--";
+}
+
+function formatPercent(value: number | undefined | null) {
+  if (value === undefined || value === null || !Number.isFinite(value)) return "--";
+  return (value >= 0 ? "+" : "") + value.toFixed(2) + "%";
+}
+
+function formatTimestamp(value: number | undefined | null) {
   if (!value) return "--";
-  return Number(value).toLocaleString("en-US", { maximumFractionDigits: 6 });
+  return new Date(value).toLocaleString();
 }
 
 watch(interval, () => {
@@ -138,10 +210,13 @@ watch(interval, () => {
 });
 onMounted(() => {
   void loadMarket();
+  void loadFuturesContext();
   refreshTimer = window.setInterval(() => void loadMarket(), 15_000);
+  contextTimer = window.setInterval(() => void loadFuturesContext(), 60_000);
 });
 onBeforeUnmount(() => {
   if (refreshTimer) window.clearInterval(refreshTimer);
+  if (contextTimer) window.clearInterval(contextTimer);
   resizeObserver?.disconnect();
   chart?.remove();
   chart = null;
@@ -166,9 +241,9 @@ onBeforeUnmount(() => {
       <div>
         <div class="eyebrow">MARKET OVERVIEW</div>
         <h1>加密货币行情中心</h1>
-        <p>多交易所现货行情 · U 本位合约独立数据源 · 原版 Price Action 两阶段分析</p>
+        <p>多交易所现货行情 · Gate USDT 永续合约统计 · 原版 Price Action 两阶段分析</p>
       </div>
-      <div class="refresh-state">{{ loading ? "正在同步…" : "每 15 秒刷新" }}</div>
+      <div class="refresh-state">{{ loading ? "正在同步…" : "K 线每 15 秒刷新" }}</div>
     </section>
 
     <section class="toolbar panel">
@@ -176,7 +251,7 @@ onBeforeUnmount(() => {
         <span>市场</span>
         <select v-model="market" @change="onMarketChange">
           <option value="spot">现货 Spot</option>
-          <option value="usdm">U 本位合约</option>
+          <option value="usdm">USDT 永续合约</option>
         </select>
       </label>
       <label v-if="market === 'spot'">
@@ -189,11 +264,14 @@ onBeforeUnmount(() => {
       </label>
       <label v-else>
         <span>合约数据源</span>
-        <select disabled><option>Binance USDⓈ-M</option></select>
+        <select v-model="exchange" @change="onExchangeChange">
+          <option value="gate">Gate.io USDT 永续</option>
+          <option value="binance">Binance Global USDⓈ-M</option>
+        </select>
       </label>
       <label class="symbol-field">
         <span>交易对</span>
-        <input v-model="symbol" spellcheck="false" @keyup.enter="loadMarket" />
+        <input v-model="symbol" spellcheck="false" @keyup.enter="queryMarket" />
       </label>
       <label>
         <span>周期</span>
@@ -201,16 +279,17 @@ onBeforeUnmount(() => {
           <option v-for="tf in ['1m','5m','15m','30m','1h','4h','1d']" :key="tf" :value="tf">{{ tf }}</option>
         </select>
       </label>
-      <button class="secondary-button" :disabled="loading" @click="loadMarket">查询行情</button>
+      <button class="secondary-button" :disabled="loading" @click="queryMarket">查询行情</button>
       <button class="primary-button" :disabled="analysisLoading" @click="runAnalysis">
         {{ analysisLoading ? "AI 分析中…" : "AI 两阶段分析" }}
       </button>
     </section>
 
     <div v-if="market === 'usdm' && exchange === 'binance'" class="notice-banner">
-      当前合约行情仍使用 Binance Global。若该网络返回 HTTP 451，切换到现货并选择 Coinbase 或 Binance.US；美国合规期货数据需要单独接入 Coinbase Derivatives 的 FIX/UDP 市场数据服务，不能用现货行情冒充永续合约。
+      Binance Global USD-M 在当前网络已返回 HTTP 451。请切换 Gate.io USDT 永续；不会使用现货数据替代合约数据。
     </div>
     <div v-if="error" class="error-banner">{{ error }}</div>
+    <div v-if="contextError" class="error-banner">{{ contextError }}</div>
     <div v-if="analysisError" class="error-banner">{{ analysisError }}</div>
 
     <section class="stats-grid">
@@ -236,6 +315,75 @@ onBeforeUnmount(() => {
         <strong>{{ formatNumber(ticker?.low_price) }}</strong>
         <span class="stat-foot">24H Low</span>
       </article>
+    </section>
+
+    <section v-if="market === 'usdm' && exchange === 'gate'" class="futures-context panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Gate 合约市场统计</h2>
+          <p>公开接口 · 5 分钟统计 · 每 60 秒刷新</p>
+        </div>
+        <span class="data-badge">{{ contextLoading ? "SYNCING" : "GATE PUBLIC DATA" }}</span>
+      </div>
+      <div v-if="futuresContext" class="futures-metrics">
+        <div class="futures-metric">
+          <span>资金费率</span>
+          <strong>{{ formatFundingRate(futuresContext.funding_rate) }}</strong>
+          <small>结算周期 {{ futuresContext.funding_interval_seconds ? (futuresContext.funding_interval_seconds / 3600) + " 小时" : "--" }}</small>
+        </div>
+        <div class="futures-metric">
+          <span>持仓量 USD</span>
+          <strong>{{ formatNumber(futuresContext.open_interest_usd) }}</strong>
+          <small>合约张数 {{ formatNumber(futuresContext.open_interest) }}</small>
+        </div>
+        <div class="futures-metric">
+          <span>OI 统计窗口变化</span>
+          <strong>{{ formatPercent(futuresContext.open_interest_change_pct) }}</strong>
+          <small>窗口 {{ futuresContext.stats_window_minutes ?? "--" }} 分钟</small>
+        </div>
+        <div class="futures-metric">
+          <span>全体账户多空比</span>
+          <strong>{{ formatNumber(futuresContext.global_long_short_ratio) }}</strong>
+          <small>Gate lsr_account</small>
+        </div>
+        <div class="futures-metric">
+          <span>主动交易多空比</span>
+          <strong>{{ formatNumber(futuresContext.taker_long_short_ratio) }}</strong>
+          <small>Gate lsr_taker</small>
+        </div>
+        <div class="futures-metric">
+          <span>大户账户多空比</span>
+          <strong>{{ formatNumber(futuresContext.top_trader_long_short_account_ratio) }}</strong>
+          <small>Top trader accounts</small>
+        </div>
+        <div class="futures-metric">
+          <span>大户持仓多空比</span>
+          <strong>{{ formatNumber(futuresContext.top_trader_long_short_position_ratio) }}</strong>
+          <small>Top trader positions</small>
+        </div>
+        <div class="futures-metric liquidation-long">
+          <span>近 {{ futuresContext.stats_window_minutes ?? "--" }} 分钟多头爆仓</span>
+          <strong>{{ formatNumber(futuresContext.long_liquidation_usd_3h) }} USDT</strong>
+          <small>合约张数 {{ formatNumber(futuresContext.long_liquidation_contracts_3h) }}</small>
+        </div>
+        <div class="futures-metric liquidation-short">
+          <span>近 {{ futuresContext.stats_window_minutes ?? "--" }} 分钟空头爆仓</span>
+          <strong>{{ formatNumber(futuresContext.short_liquidation_usd_3h) }} USDT</strong>
+          <small>合约张数 {{ formatNumber(futuresContext.short_liquidation_contracts_3h) }}</small>
+        </div>
+      </div>
+      <div v-else class="context-empty">
+        {{ contextLoading ? "正在获取合约统计…" : "暂时没有可用的合约统计数据" }}
+      </div>
+      <div v-if="futuresContext" class="context-meta">
+        <span>标记价格：{{ formatNumber(futuresContext.mark_price) }}</span>
+        <span>指数价格：{{ formatNumber(futuresContext.index_price) }}</span>
+        <span>下一次资金费结算：{{ formatTimestamp(futuresContext.next_funding_time) }}</span>
+        <span>数据时间：{{ formatTimestamp(futuresContext.data_timestamp) }}</span>
+      </div>
+      <div v-if="futuresContext" class="context-quality">
+        <span v-for="(value, key) in futuresContext.data_quality" :key="key">{{ key }}: {{ value }}</span>
+      </div>
     </section>
 
     <section v-if="analysis" class="analysis-results panel">
@@ -278,7 +426,7 @@ onBeforeUnmount(() => {
       <article class="chart-panel panel">
         <div class="panel-heading">
           <div>
-            <h2>{{ symbol }} <span class="muted">{{ market === "spot" ? "SPOT" : "USDⓈ-M" }}</span></h2>
+            <h2>{{ symbol }} <span class="muted">{{ market === "spot" ? "SPOT" : "USDT PERPETUAL" }}</span></h2>
             <p>{{ interval }} · {{ exchangeLabel }} · K 线数据</p>
           </div>
           <span class="data-badge">REST MARKET DATA</span>
@@ -294,16 +442,17 @@ onBeforeUnmount(() => {
       <aside class="side-column">
         <article class="panel info-panel">
           <div class="panel-heading"><h2>行情提供商</h2><span class="coming-soon">多源适配</span></div>
-          <div class="module-row"><span>Binance Global</span><b>现货 / USD-M</b></div>
+          <div class="module-row"><span>Binance Vision</span><b>现货</b></div>
           <div class="module-row"><span>Binance.US</span><b>现货</b></div>
           <div class="module-row"><span>Coinbase Exchange</span><b>现货</b></div>
-          <div class="module-row"><span>Coinbase Derivatives</span><b>FIX/UDP 待接入</b></div>
+          <div class="module-row"><span>Gate.io</span><b>USDT 永续 · 已本地验证</b></div>
+          <div class="module-row"><span>Binance USD-M</span><b>当前网络 451</b></div>
         </article>
         <article class="panel info-panel">
           <div class="panel-heading"><h2>24 小时成交</h2></div>
           <div class="metric-line"><span>基础资产成交量</span><strong>{{ formatNumber(ticker?.volume) }}</strong></div>
           <div class="metric-line"><span>计价资产成交额</span><strong>{{ formatNumber(ticker?.quote_volume) }}</strong></div>
-          <p class="notice">各交易所交易对和计价货币不同，例如 Coinbase 使用 BTC-USD，Binance 使用 BTCUSDT。不可将不同市场的 OHLCV 直接拼接。此版本仅读取公开行情，不连接账户或执行交易。</p>
+          <p class="notice">不同交易所的交易对、计价货币和成交量单位可能不同。Gate K 线成交量已使用 quanto_multiplier 从合约张数换算为基础资产数量；原始合约张数单独保留。当前仅读取公开行情，不连接账户或执行交易。</p>
         </article>
       </aside>
     </section>

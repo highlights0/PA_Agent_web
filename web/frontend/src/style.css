@@ -98,3 +98,69 @@ footer { padding: 24px 0 0; color: #53667f; font-size: 10px; text-align: center;
   font-size: 12px;
   line-height: 1.65;
 }
+
+
+.futures-context {
+  margin: 16px 0;
+  padding: 18px;
+}
+.futures-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+.futures-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid #22334a;
+  border-radius: 10px;
+  background: #0a1321;
+}
+.futures-metric span {
+  color: #8194ab;
+  font-size: 10px;
+}
+.futures-metric strong {
+  color: #e5edf8;
+  font-size: 17px;
+  overflow-wrap: anywhere;
+}
+.futures-metric small {
+  color: #657991;
+  font-size: 9px;
+}
+.futures-metric.liquidation-long strong {
+  color: #fca5a5;
+}
+.futures-metric.liquidation-short strong {
+  color: #86efac;
+}
+.context-meta, .context-quality {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 13px;
+  color: #71839a;
+  font-size: 10px;
+}
+.context-quality {
+  padding-top: 10px;
+  border-top: 1px solid #1c2a3d;
+}
+.context-empty {
+  padding: 24px 0;
+  color: #8294aa;
+  font-size: 12px;
+}
+@media (max-width: 900px) {
+  .futures-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 520px) {
+  .futures-metrics { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .futures-metric { padding: 10px; }
+  .futures-metric strong { font-size: 14px; }
+}

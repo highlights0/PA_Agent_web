@@ -26,6 +26,9 @@ class Settings:
     coinbase_spot_rest_url: str = os.getenv(
         "COINBASE_SPOT_REST_URL", "https://api.exchange.coinbase.com"
     )
+    gate_futures_rest_url: str = os.getenv(
+        "GATE_FUTURES_REST_URL", "https://api.gateio.ws/api/v4"
+    )
     request_timeout_seconds: float = float(os.getenv("BINANCE_HTTP_TIMEOUT", "10"))
     max_klines: int = int(os.getenv("PUBLIC_MAX_BARS", "300"))
     cors_origins: tuple[str, ...] = _csv_env(

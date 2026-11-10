@@ -11,6 +11,7 @@ from app.adapters.binance.models import MarketType
 from app.adapters.binance.normalizer import to_core_bars
 from app.core.config import Settings as WebSettings
 from app.services.crypto_context import CryptoMarketContext, render_crypto_context
+from app.services.crypto_prompt_assembler import CryptoPromptAssembler
 
 logger = logging.getLogger("pa_crypto.analysis")
 
@@ -45,7 +46,7 @@ def _context_period(timeframe: str) -> str:
         return timeframe
     if timeframe in {"1m", "3m"}:
         return "5m"
-    if timeframe == "8h":
+    if timeframe in {"8h"}:
         return "6h"
     return "1d"
 
@@ -69,10 +70,12 @@ class AnalysisService:
             raise AnalysisConfigurationError("AI_API_KEY is not configured on the server")
         if analysis_bars < 20 or analysis_bars + 50 > self._web_settings.max_klines:
             raise ValueError("analysis_bars must be between 20 and server max bars minus 50")
-        if market == "usdm" and exchange != "binance":
+        if market == "usdm" and exchange not in {"binance", "gate"}:
             raise ValueError(
-                f"{exchange} USD-M futures are not configured; no cross-exchange substitution is allowed"
+                f"{exchange} USDT perpetual futures are not configured; no cross-exchange substitution is allowed"
             )
+        if market == "spot" and exchange == "gate":
+            raise ValueError("Gate provider currently supports USDT perpetual futures only")
 
         rows = await self._market.klines(
             market, symbol, timeframe, analysis_bars + 50, exchange
@@ -92,8 +95,11 @@ class AnalysisService:
             )
 
         if market == "usdm":
+            context_period = "5m" if exchange == "gate" else _context_period(timeframe)
             derivatives = await self._market.futures_context(
-                symbol, _context_period(timeframe)
+                symbol,
+                context_period,
+                exchange,
             )
             context = CryptoMarketContext(
                 market_type=market,
@@ -104,6 +110,7 @@ class AnalysisService:
 
             context = CryptoMarketContext(
                 market_type=f"spot:{exchange}",
+                exchange=exchange,
                 symbol=symbol,
                 data_timestamp=int(time.time() * 1000),
                 data_quality={

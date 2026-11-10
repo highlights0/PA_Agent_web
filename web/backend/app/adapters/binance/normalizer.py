@@ -13,7 +13,7 @@ _INTERVAL_MS = {
     "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
     "4h": 14_400_000, "6h": 21_600_000, "8h": 28_800_000,
     "12h": 43_200_000, "1d": 86_400_000, "3d": 259_200_000,
-    "1w": 604_800_000,
+    "1w": 604_800_000, "7d": 604_800_000,
 }
 
 
@@ -27,7 +27,13 @@ def _decimal_string(value: Any, field: str) -> str:
     return format(number, "f")
 
 
-def normalize_klines(rows: list[Any], *, now_ms: int | None = None) -> list[KlineDTO]:
+def normalize_klines(
+    rows: list[Any],
+    *,
+    market_type: str = "spot",
+    exchange: str = "binance",
+    now_ms: int | None = None,
+) -> list[KlineDTO]:
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     normalized: list[KlineDTO] = []
     previous_open_time = -1
@@ -53,6 +59,9 @@ def normalize_klines(rows: list[Any], *, now_ms: int | None = None) -> list[Klin
                 taker_buy_base_volume=_decimal_string(row[9], "taker_buy_base_volume"),
                 taker_buy_quote_volume=_decimal_string(row[10], "taker_buy_quote_volume"),
                 closed=close_time < now,
+                exchange=exchange,
+                market_type=market_type,
+                volume_unit="base_asset",
             )
         )
     return normalized
@@ -92,6 +101,63 @@ def normalize_coinbase_klines(
                 taker_buy_base_volume="",
                 taker_buy_quote_volume="",
                 closed=close_time < now,
+                exchange="coinbase",
+                market_type="spot",
+                volume_unit="base_asset",
+            )
+        )
+    return normalized
+
+
+def normalize_gate_klines(
+    rows: list[dict[str, Any]],
+    *,
+    interval: str,
+    quanto_multiplier: str,
+    now_ms: int | None = None,
+) -> list[KlineDTO]:
+    """Gate candles use contract volume v and quote turnover sum; convert v to base volume."""
+    if interval not in _INTERVAL_MS:
+        raise ValueError(f"Unsupported Gate candle interval: {interval}")
+    multiplier = Decimal(_decimal_string(quanto_multiplier, "quanto_multiplier"))
+    if multiplier <= 0:
+        raise ValueError("Gate contract quanto_multiplier must be positive")
+    for row in rows:
+        if not isinstance(row, dict) or "t" not in row:
+            raise ValueError("Malformed Gate futures candle row")
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    ordered = sorted(rows, key=lambda row: int(row["t"]))
+    normalized: list[KlineDTO] = []
+    previous_open_time = -1
+    duration = _INTERVAL_MS[interval]
+
+    for row in ordered:
+        open_time = int(row["t"]) * 1000
+        if open_time <= previous_open_time:
+            raise ValueError("Gate candles contain duplicate timestamps")
+        previous_open_time = open_time
+
+        contract_volume = _decimal_string(row.get("v"), "contract_volume")
+        base_volume = Decimal(contract_volume) * multiplier
+        close_time = open_time + duration - 1
+        normalized.append(
+            KlineDTO(
+                open_time=open_time,
+                close_time=close_time,
+                open=_decimal_string(row.get("o"), "open"),
+                high=_decimal_string(row.get("h"), "high"),
+                low=_decimal_string(row.get("l"), "low"),
+                close=_decimal_string(row.get("c"), "close"),
+                volume=format(base_volume, "f"),
+                quote_volume=_decimal_string(row.get("sum"), "quote_volume") if row.get("sum") is not None else "",
+                trades=0,
+                taker_buy_base_volume="",
+                taker_buy_quote_volume="",
+                closed=close_time < now,
+                exchange="gate",
+                market_type="usdm",
+                volume_unit="base_asset",
+                contract_volume=contract_volume,
             )
         )
     return normalized

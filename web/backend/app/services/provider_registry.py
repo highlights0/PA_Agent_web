@@ -7,6 +7,7 @@ from app.adapters.binance.futures_rest import BinanceUSDMREST
 from app.adapters.binance.spot_rest import BinanceSpotREST
 from app.adapters.binance_us.spot_rest import BinanceUSSpotREST
 from app.adapters.coinbase.spot_rest import CoinbaseSpotREST
+from app.adapters.gate.futures_rest import GateFuturesREST
 
 
 class UnsupportedMarketProvider(ValueError):
@@ -23,12 +24,14 @@ class ProviderRegistry:
         binance_futures: BinanceUSDMREST,
         binance_us_spot: BinanceUSSpotREST,
         coinbase_spot: CoinbaseSpotREST,
+        gate_futures: GateFuturesREST,
     ) -> None:
         self._providers: dict[tuple[str, str], Any] = {
             ("binance", "spot"): binance_spot,
             ("binance", "usdm"): binance_futures,
             ("binance_us", "spot"): binance_us_spot,
             ("coinbase", "spot"): coinbase_spot,
+            ("gate", "usdm"): gate_futures,
         }
 
     @property
@@ -37,6 +40,7 @@ class ProviderRegistry:
             "binance": ["spot", "usdm"],
             "binance_us": ["spot"],
             "coinbase": ["spot"],
+            "gate": ["usdm"],
         }
 
     def get(self, exchange: str, market: str) -> Any:

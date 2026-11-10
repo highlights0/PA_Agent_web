@@ -13,6 +13,7 @@ from app.adapters.binance.futures_rest import BinanceUSDMREST
 from app.adapters.binance.spot_rest import BinanceSpotREST
 from app.adapters.binance_us.spot_rest import BinanceUSSpotREST
 from app.adapters.coinbase.spot_rest import CoinbaseSpotREST
+from app.adapters.gate.futures_rest import GateFuturesREST
 from app.api.v1.analysis import router as analysis_router
 from app.api.v1.market import router as market_router
 from app.core.config import settings
@@ -24,7 +25,7 @@ from app.services.provider_registry import ProviderRegistry
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     timeout = httpx.Timeout(settings.request_timeout_seconds)
-    limits = httpx.Limits(max_connections=80, max_keepalive_connections=30)
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=40)
     http = httpx.AsyncClient(timeout=timeout, limits=limits, follow_redirects=False)
 
     binance_spot = BinanceSpotREST(
@@ -39,14 +40,18 @@ async def lifespan(app: FastAPI):
     coinbase_spot = CoinbaseSpotREST(
         BinanceRESTClient(http, settings.coinbase_spot_rest_url)
     )
+    gate_futures = GateFuturesREST(
+        BinanceRESTClient(http, settings.gate_futures_rest_url)
+    )
 
     providers = ProviderRegistry(
         binance_spot=binance_spot,
         binance_futures=binance_futures,
         binance_us_spot=binance_us_spot,
         coinbase_spot=coinbase_spot,
+        gate_futures=gate_futures,
     )
-    market_service = MarketService(providers, binance_futures)
+    market_service = MarketService(providers, binance_futures, gate_futures)
 
     from app.services.analysis_service import AnalysisService
 
@@ -66,10 +71,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="PA Crypto Agent API",
-    version="0.4.0",
+    version="0.5.0",
     description=(
-        "Multi-exchange public crypto market data: Binance, Binance.US and Coinbase Spot. "
-        "Binance USD-M Futures is a separate capability. No trading endpoints."
+        "Multi-exchange public crypto market data: Binance, Binance.US, Coinbase Spot, "
+        "and Gate.io USDT perpetual futures. No trading endpoints."
     ),
     lifespan=lifespan,
 )

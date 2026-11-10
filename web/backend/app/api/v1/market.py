@@ -13,10 +13,10 @@ from app.services.provider_registry import UnsupportedMarketProvider
 router = APIRouter()
 _INTERVALS = {
     "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h",
-    "12h", "1d", "3d", "1w", "1M",
+    "12h", "1d", "3d", "1w", "1M", "7d",
 }
-_SYMBOL_RE = re.compile(r"^[A-Z0-9-]{3,24}$")
-Exchange = Literal["binance", "binance_us", "coinbase"]
+_SYMBOL_RE = re.compile(r"^[A-Z0-9_-]{3,32}$")
+Exchange = Literal["binance", "binance_us", "coinbase", "gate"]
 
 
 def _service(request: Request):
@@ -132,9 +132,12 @@ async def get_ticker(
 async def get_futures_context(
     request: Request,
     symbol: str,
-    period: Literal["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"] = "15m",
+    exchange: Literal["binance", "gate"] = Query(default="binance"),
+    period: Literal["5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"] = "5m",
 ):
     try:
-        return await _service(request).futures_context(_validate_symbol(symbol), period)
+        return await _service(request).futures_context(
+            _validate_symbol(symbol), period, exchange
+        )
     except Exception as exc:
-        raise _provider_error("binance", exc) from exc
+        raise _provider_error(exchange, exc) from exc

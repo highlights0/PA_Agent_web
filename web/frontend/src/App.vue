@@ -4,6 +4,7 @@ import { ColorType, createChart, type IChartApi, type ISeriesApi } from "lightwe
 import {
   api,
   type AnalysisResult,
+  type AnalysisJobSnapshot,
   type Exchange,
   type FuturesContext,
   type FuturesExchange,
@@ -12,6 +13,7 @@ import {
   type Ticker,
 } from "./api";
 import AISettingsPanel from "./AISettingsPanel.vue";
+import AnalysisProcessPanel from "./AnalysisProcessPanel.vue";
 
 const market = ref<Market>("spot");
 const exchange = ref<Exchange>("coinbase");
@@ -21,6 +23,8 @@ const klines = ref<Kline[]>([]);
 const ticker = ref<Ticker | null>(null);
 const futuresContext = ref<FuturesContext | null>(null);
 const analysis = ref<AnalysisResult | null>(null);
+const analysisJob = ref<AnalysisJobSnapshot | null>(null);
+const showAnalysisProcess = ref(false);
 const loading = ref(false);
 const contextLoading = ref(false);
 const analysisLoading = ref(false);
@@ -34,6 +38,7 @@ let candleSeries: ISeriesApi<"Candlestick"> | null = null;
 let resizeObserver: ResizeObserver | null = null;
 let refreshTimer: number | undefined;
 let contextTimer: number | undefined;
+let pollActive = true;
 
 const changePositive = computed(() => Number(ticker.value?.price_change_percent ?? 0) >= 0);
 const diagnosis = computed<Record<string, any>>(() => analysis.value?.stage1_diagnosis ?? {});
@@ -131,17 +136,40 @@ async function runAnalysis() {
   analysisLoading.value = true;
   analysisError.value = "";
   analysis.value = null;
+  showAnalysisProcess.value = true;
   try {
     const normalized = symbol.value.trim().toUpperCase();
-    const result = await api.analyze(market.value, exchange.value, normalized, interval.value, 100);
-    analysis.value = result;
-    if (result.status === "failed") {
-      analysisError.value = result.error?.message || "AI 分析未通过校验";
+    let snapshot = await api.startAnalysis(
+      market.value,
+      exchange.value,
+      normalized,
+      interval.value,
+      100,
+    );
+    analysisJob.value = snapshot;
+
+    // Polling is owned by the page, not the drawer. Closing the drawer never
+    // cancels the job or stops progress collection.
+    while (pollActive && (snapshot.status === "queued" || snapshot.status === "running")) {
+      await new Promise((resolve) => window.setTimeout(resolve, 900));
+      if (!pollActive) break;
+      snapshot = await api.getAnalysisJob(snapshot.job_id);
+      analysisJob.value = snapshot;
+    }
+
+    if (!pollActive) return;
+    if (snapshot.result) {
+      analysis.value = snapshot.result;
+      if (snapshot.result.status === "failed") {
+        analysisError.value = snapshot.result.error?.message || "AI 分析未通过校验";
+      }
+    } else if (snapshot.status === "failed") {
+      analysisError.value = snapshot.error?.message || "AI 分析任务失败";
     }
   } catch (err) {
     analysisError.value = err instanceof Error ? err.message : "AI 分析失败";
   } finally {
-    analysisLoading.value = false;
+    if (pollActive) analysisLoading.value = false;
   }
 }
 
@@ -217,6 +245,7 @@ onMounted(() => {
   contextTimer = window.setInterval(() => void loadFuturesContext(), 60_000);
 });
 onBeforeUnmount(() => {
+  pollActive = false;
   if (refreshTimer) window.clearInterval(refreshTimer);
   if (contextTimer) window.clearInterval(contextTimer);
   resizeObserver?.disconnect();
@@ -238,6 +267,14 @@ onBeforeUnmount(() => {
       </div>
       <div class="topbar-actions">
         <div class="connection"><span class="live-dot"></span> 多交易所公开行情</div>
+        <button
+          class="process-menu-button"
+          :class="{ active: showAnalysisProcess }"
+          @click="showAnalysisProcess = !showAnalysisProcess"
+        >
+          <span>☷</span> 分析过程
+          <i v-if="analysisLoading" class="process-live-dot"></i>
+        </button>
         <button class="settings-button" @click="showAiSettings = true">
           <span>⚙</span> AI 模型设置
         </button>
@@ -465,6 +502,11 @@ onBeforeUnmount(() => {
     </section>
 
     <footer>PA Crypto Agent · Public market data · Not investment advice</footer>
+    <AnalysisProcessPanel
+      v-if="showAnalysisProcess"
+      :job="analysisJob"
+      @close="showAnalysisProcess = false"
+    />
     <AISettingsPanel
       v-if="showAiSettings"
       @close="showAiSettings = false"

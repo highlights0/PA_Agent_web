@@ -20,6 +20,7 @@ from app.api.v1.market import router as market_router
 from app.core.config import settings
 from app.core.public_quota import PublicAnalysisQuota
 from app.services.ai_provider_store import AIProviderStore
+from app.services.analysis_jobs import AnalysisJobStore
 from app.services.market_service import MarketService
 from app.services.provider_registry import ProviderRegistry
 
@@ -68,6 +69,8 @@ async def lifespan(app: FastAPI):
     app.state.analysis_service = AnalysisService(
         market_service, settings, ai_provider_store
     )
+    app.state.analysis_jobs = AnalysisJobStore()
+    app.state.analysis_tasks = set()
     app.state.analysis_quota = PublicAnalysisQuota(settings.public_analysis_per_ip_daily)
     app.state.analysis_semaphore = asyncio.Semaphore(
         max(1, settings.public_max_concurrent_analyses)

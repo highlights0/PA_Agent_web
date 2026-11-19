@@ -53,6 +53,27 @@ Official Gate API documentation: [Futures REST API](https://www.gate.com/docs/de
 
 The Gate context endpoint returns funding rate, funding interval/next funding time, mark/index price, OI in contracts and quote currency, OI window change, account/taker/top-trader ratios, and aggregate long/short liquidation amounts. Missing fields are null and described in `data_quality`; they are never filled with zero or another exchange's values.
 
+## Analysis process drawer
+
+The main dashboard keeps the analysis process closed by default. Click the top-menu item **分析过程** to open the right-side drawer; click it again or use the close button to hide it. The drawer does not cancel an active analysis. The page continues polling the job in the background and the latest trace can be reopened after completion.
+
+The drawer exposes the original orchestrator's observable workflow:
+
+- K-line fetch, closed-bar/frame preparation, and derivatives-context preparation
+- Original preflight event and Stage 1 / Stage 2 start, retry, done, failed, cancel, and record-saved events
+- Prompt metadata (message sizes and headings only; full system/user prompts are not copied into the trace)
+- Model-call timing, output character count, token usage, and request failures
+- Each JSON validation result, category, missing/invalid fields, parse position, and retry number
+- Stage 1 structured diagnosis, strategy files selected by the original router, loaded experience metadata, and Stage 2 structured decision
+- Gate short-circuit when Stage 1 returns `gate_result=wait/unknown`
+- K-line frame summary and source-attributed derivatives context/data-quality fields
+
+The trace includes the model's ordinary `content` response text and the structured validated output, so format problems can be inspected. It intentionally excludes model `reasoning_content` / hidden chain-of-thought, API keys, authorization headers, and raw provider request headers. Prompt bodies are not copied into the trace; only prompt sizes and section headings are shown.
+
+The Web app uses `POST /api/v1/analysis/jobs` to start a job and polls `GET /api/v1/analysis/jobs/{job_id}` for progress. The older synchronous `POST /api/v1/analysis` endpoint remains available for compatibility. Job traces are currently held in process memory and are lost on backend restart; durable analysis history is a follow-up feature.
+
+Note: the current Web adapter explicitly sets `experience_max_entries=0`, so the drawer will accurately show that no historical experience cases were loaded. This is not presented as if the original desktop experience library had run.
+
 ## Browser AI model settings
 
 Open the Web app at http://localhost:5173 and click **AI 模型设置** in the top-right corner. The browser settings reproduce the original desktop PA Agent provider fields:

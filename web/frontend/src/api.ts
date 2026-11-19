@@ -63,6 +63,55 @@ export interface FuturesContext {
   data_quality: Record<string, string>;
 }
 
+
+export interface AnalysisTraceEvent {
+  id: number;
+  timestamp: string;
+  elapsed_ms: number;
+  type: string;
+  stage: string | null;
+  title: string;
+  detail: string;
+  data: Record<string, any>;
+}
+
+export interface AnalysisRunDetails {
+  provider: Record<string, any>;
+  frame: Record<string, any>;
+  market_context: Record<string, any>;
+  prompts: Record<string, any>;
+  validation: Array<Record<string, any>>;
+  model_calls: Array<Record<string, any>>;
+  strategy_files_used: string[];
+  experience_loaded: Array<Record<string, any>>;
+  experience_loaded_count: number;
+  stage2_short_circuited: boolean;
+  stage1_diagnosis: Record<string, any> | null;
+  stage2_decision: Record<string, any> | null;
+  usage: Record<string, number>;
+  exception: Record<string, any> | null;
+}
+
+export interface AnalysisJobSnapshot {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  request: {
+    market: Market;
+    exchange: Exchange;
+    symbol: string;
+    timeframe: string;
+    analysis_bars: number;
+  };
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  trace: AnalysisTraceEvent[];
+  result: AnalysisResult | null;
+  details: AnalysisRunDetails | null;
+  error: { status_code: number; message: string } | null;
+}
+
 export interface AnalysisResult {
   analysis_id: string;
   status: "completed" | "failed";
@@ -77,6 +126,8 @@ export interface AnalysisResult {
   usage: Record<string, number>;
   error: Record<string, any> | null;
   quota_remaining: number;
+  trace?: AnalysisTraceEvent[];
+  details?: AnalysisRunDetails;
 }
 
 
@@ -170,6 +221,27 @@ export const api = {
         analysis_bars: analysisBars,
       }),
     }),
+  startAnalysis: (
+    market: Market,
+    exchange: Exchange,
+    symbol: string,
+    timeframe: string,
+    analysisBars = 100,
+  ) =>
+    request<AnalysisJobSnapshot>("/api/v1/analysis/jobs", {
+      method: "POST",
+      body: JSON.stringify({
+        market,
+        exchange,
+        symbol,
+        timeframe,
+        analysis_bars: analysisBars,
+      }),
+    }),
+  getAnalysisJob: (jobId: string) =>
+    request<AnalysisJobSnapshot>(
+      "/api/v1/analysis/jobs/" + encodeURIComponent(jobId),
+    ),
   aiProviders: (adminToken = "") =>
     request<AIProviderList>("/api/v1/ai/providers", {
       headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},

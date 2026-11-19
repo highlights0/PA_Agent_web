@@ -321,6 +321,12 @@ class AnalysisService:
             title="原版 PA 两阶段编排器已就绪",
             detail="保留原版预检、阶段一、策略路由、阶段二和校验重试逻辑",
         )
+        trace.emit(
+            "preflight_started",
+            stage="preflight",
+            title="开始数据预检",
+            detail="执行原版 check_preflight_data；通过后才进入阶段一",
+        )
         record = orchestrator.submit(
             frame=frame,
             cancel_token=CancelToken(),

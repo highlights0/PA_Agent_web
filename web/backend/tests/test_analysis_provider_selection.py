@@ -15,6 +15,7 @@ class FakeProviderStore:
 
 def test_analysis_uses_active_browser_provider_instead_of_legacy_environment_key():
     selected = {
+        "name": "自定义测试模型",
         "model": "custom-reasoner",
         "base_url": "https://gateway.example/v1",
         "api_key": "sk-browser-configured",

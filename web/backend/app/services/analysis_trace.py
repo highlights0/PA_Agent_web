@@ -34,7 +34,7 @@ def _safe_output(value: Any, limit: int = 12000) -> str:
     text = str(value or "")
     for pattern in _SECRET_PATTERNS:
         if pattern.pattern.startswith("(?i)"):
-            text = pattern.sub(r"\\1=***", text)
+            text = pattern.sub(r"\1=***", text)
         else:
             text = pattern.sub("***", text)
     return text[:limit]

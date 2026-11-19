@@ -86,7 +86,7 @@ def _validate_payload(payload: AnalysisRequest, request: Request) -> str:
     if not _analysis_enabled(request):
         raise HTTPException(
             status_code=503,
-            detail="AI 分析未启用或尚未配置可用模型，请先在网页 AI 模型设置中配置模型。",
+            detail="AI analysis is disabled or no usable model is configured. 请先在网页 AI 模型设置中配置模型。",
         )
     symbol = payload.symbol.strip().upper()
     if not _SYMBOL_RE.fullmatch(symbol):

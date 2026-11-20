@@ -612,24 +612,32 @@ class AnalysisHistoryStore:
             params.append(period)
         if not include_snapshots:
             clauses.append("data_kind='historical'")
-        params.append(min(max(int(limit), 1), 50000))
+        bounded_limit = min(max(int(limit), 1), 50000)
         with self._session() as db:
+            eligible_total = db.execute(
+                f"""
+                SELECT COUNT(*) FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            ).fetchone()[0]
             rows = db.execute(
                 f"""
                 SELECT * FROM derivatives_observations
                 WHERE {' AND '.join(clauses)}
-                ORDER BY available_at_ms ASC, event_time_ms ASC
+                ORDER BY available_at_ms DESC, event_time_ms DESC
                 LIMIT ?
                 """,
-                params,
+                [*params, bounded_limit],
             ).fetchall()
             total_rows = db.execute(
-                f"""
+                """
                 SELECT COUNT(*) FROM derivatives_observations
                 WHERE market=? AND exchange=? AND symbol=?
                 """,
                 (market, exchange, symbol.upper()),
             ).fetchone()[0]
+        rows = list(reversed(rows))
         items = [
             {
                 "market": row["market"],
@@ -650,8 +658,10 @@ class AnalysisHistoryStore:
         ]
         return {
             "items": items,
-            "eligible_count": len(items),
-            "excluded_or_unavailable_count": max(0, int(total_rows) - len(items)),
+            "eligible_count": int(eligible_total),
+            "returned_count": len(items),
+            "truncated": int(eligible_total) > len(items),
+            "excluded_or_unavailable_count": max(0, int(total_rows) - int(eligible_total)),
             "latest_available_at_ms": max(
                 (item["available_at_ms"] for item in items),
                 default=None,

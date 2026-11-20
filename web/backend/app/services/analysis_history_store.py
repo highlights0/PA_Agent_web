@@ -433,6 +433,27 @@ class AnalysisHistoryStore:
             ).fetchall()
         return [self._segment_row(row) for row in rows]
 
+    def evaluation_samples(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        max_rows: int = 30000,
+    ) -> list[dict[str, Any]]:
+        """Load chronological labeled samples for an explicitly chosen instrument."""
+        with self._session() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM segment_samples
+                WHERE market=? AND exchange=? AND symbol=? AND timeframe=?
+                ORDER BY decision_time_ms ASC LIMIT ?
+                """,
+                (market, exchange, symbol.upper(), timeframe, max_rows),
+            ).fetchall()
+        return [self._segment_row(row) for row in rows]
+
     def similar_segments(
         self,
         *,

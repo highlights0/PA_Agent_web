@@ -4,12 +4,23 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.api.v1.ai_settings import _authorize
+from app.services.historical_backfill import backfill_gate_candles
+from app.services.baseline_evaluation import evaluate_rule_baseline
 from app.services.segmenter import build_current_features, build_segment_samples
 
-router = APIRouter()
+async def require_history_access(
+    request: Request,
+    x_pa_admin_token: str | None = Header(default=None),
+):
+    # IP-based record grouping is not authentication.
+    _authorize(request, x_pa_admin_token)
+
+
+router = APIRouter(dependencies=[Depends(require_history_access)])
 _SYMBOL_RE = re.compile(r"^[A-Z0-9_-]{3,32}$")
 
 
@@ -166,6 +177,64 @@ async def build_historical_dataset(payload: DatasetBuildInput, request: Request)
         "dataset": stats,
         "note": "历史样本按已收盘 K 线构建；未来标签仅存入 labels，不进入 features 或 AI Prompt。",
     }
+
+
+
+class BackfillInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    market: Literal["usdm"] = "usdm"
+    exchange: Literal["gate"] = "gate"
+    symbol: str = Field(min_length=3, max_length=32)
+    timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"] = "15m"
+    bars: int = Field(default=3000, ge=80, le=12000)
+
+
+@router.post("/history/dataset/backfill")
+async def backfill_history(payload: BackfillInput, request: Request):
+    """Bounded Gate backfill; each page uses from/to without limit."""
+    symbol = _symbol(payload.symbol)
+    try:
+        response = await backfill_gate_candles(
+            request.app.state.market_service._gate_futures,
+            symbol=symbol,
+            timeframe=payload.timeframe,
+            requested_bars=payload.bars,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Gate 历史回补失败：{str(exc)[:240]}") from exc
+    samples = build_segment_samples(
+        response["bars"], market="usdm", exchange="gate",
+        symbol=symbol, timeframe=payload.timeframe,
+    )
+    new_samples = _history(request).upsert_segments(samples)
+    return {
+        "requested_bars": payload.bars,
+        "received_bars": response["closed_bars"],
+        "pages": response["pages"],
+        "gaps": response["gaps"],
+        "truncated": response["truncated"],
+        "new_samples": new_samples,
+        "dataset": _history(request).dataset_stats(
+            market="usdm", exchange="gate",
+            symbol=symbol, timeframe=payload.timeframe,
+        ),
+        "note": "Gate 时间范围分页回补；不跨缺失 K 线生成未来标签。回补数据仅用于样本与评估，不自动修改 AI 决策。",
+    }
+
+
+@router.get("/history/dataset/evaluation")
+async def evaluate_history_dataset(
+    request: Request,
+    market: Literal["spot", "usdm"],
+    exchange: Literal["binance", "binance_us", "coinbase", "gate"],
+    symbol: str,
+    timeframe: str,
+):
+    samples = _history(request).evaluation_samples(
+        market=market, exchange=exchange,
+        symbol=_symbol(symbol), timeframe=timeframe,
+    )
+    return evaluate_rule_baseline(samples)
 
 
 @router.get("/history/dataset/stats")

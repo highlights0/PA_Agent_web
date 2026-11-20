@@ -15,6 +15,22 @@ FEATURE_SCHEMA_VERSION = "pa-segment-features-v1"
 LABEL_SCHEMA_VERSION = "forward-outcome-v1"
 DEFAULT_LOOKBACK_BARS = 24
 DEFAULT_HORIZON_BARS = 12
+_INTERVAL_MS = {
+    "1m": 60000, "3m": 180000, "5m": 300000,
+    "15m": 900000, "30m": 1800000,
+    "1h": 3600000, "2h": 7200000, "4h": 14400000,
+    "6h": 21600000, "8h": 28800000, "12h": 43200000,
+    "1d": 86400000, "3d": 259200000, "7d": 604800000,
+}
+
+
+def _continuous(bars: list[Any], expected_ms: int) -> bool:
+    """Reject gaps to keep future labels aligned with the requested horizon."""
+    times = [_time(bar, "open_time") or _time(bar, "ts_open") for bar in bars]
+    return bool(times) and all(
+        later - earlier == expected_ms for earlier, later in zip(times, times[1:])
+    )
+
 
 
 def _value(bar: Any, name: str, default: Any = None) -> Any:
@@ -181,18 +197,24 @@ def build_segment_samples(
     if len(closed) < lookback_bars + horizon_bars + 1:
         return []
 
+    expected_ms = _INTERVAL_MS.get(timeframe)
+    if expected_ms is None:
+        return []
     samples: list[dict[str, Any]] = []
     current_start = lookback_bars - 1
     previous_regime: str | None = None
     for index in range(lookback_bars - 1, len(closed) - horizon_bars):
         past = closed[index - lookback_bars + 1 : index + 1]
+        future = closed[index + 1 : index + 1 + horizon_bars]
+        if not _continuous(past + future, expected_ms):
+            previous_regime = None
+            continue
         regime, features = _classify_regime(past, lookback_bars)
         if regime != previous_regime:
             current_start = index
         previous_regime = regime
 
         entry = _number(closed[index], "close")
-        future = closed[index + 1 : index + 1 + horizon_bars]
         if entry <= 0 or len(future) != horizon_bars or not all(bool(_value(bar, "closed", True)) for bar in future):
             continue
         future_closes = [_number(bar, "close") for bar in future]

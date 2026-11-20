@@ -68,6 +68,30 @@ class GateFuturesREST:
             },
         )
 
+    async def klines_range(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        from_s: int,
+        to_s: int,
+    ) -> list[dict[str, Any]]:
+        """Gate from/to time-window candles; do not send limit with timestamps."""
+        if interval not in _SUPPORTED_INTERVALS:
+            raise ValueError(f"Unsupported Gate historical candle interval: {interval}")
+        if from_s < 0 or to_s < from_s:
+            raise ValueError("Invalid Gate history time range")
+        return await self._client.get(
+            "/futures/usdt/candlesticks",
+            {
+                "contract": self.contract_name(symbol),
+                "interval": interval,
+                "from": int(from_s),
+                "to": int(to_s),
+                "timezone": "utc0",
+            },
+        )
+
     async def ticker_24h(self, symbol: str) -> dict[str, Any]:
         rows = await self._client.get(
             "/futures/usdt/tickers",

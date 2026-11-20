@@ -149,3 +149,7 @@ docker compose -f deploy/docker-compose.yml up --build -d
 ~~~
 
 Open http://localhost:8080.
+
+## Bounded Gate backfill and preliminary baseline
+
+Gate time-window backfill is available in the 历史记录 → 行情样本库 view, while fixed-rule baseline testing compares only time-held-out labels against a training majority-class predictor. Neither is AI training nor a claim of AI accuracy.

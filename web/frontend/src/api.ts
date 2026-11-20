@@ -266,6 +266,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     headers: {
       Accept: "application/json",
       ...(init?.body ? { "Content-Type": "application/json" } : {}),
+      ...(path.startsWith("/api/v1/history/") && sessionStorage.getItem("pa_ai_admin_token")
+        ? { "X-PA-Admin-Token": sessionStorage.getItem("pa_ai_admin_token")! }
+        : {}),
       ...init?.headers,
     },
   });
@@ -387,6 +390,27 @@ export const api = {
       "/api/v1/history/dataset/build",
       { method: "POST", body: JSON.stringify(payload) },
     ),
+  backfillDataset: (payload: {
+    market: "usdm"; exchange: "gate"; symbol: string; timeframe: string; bars: number;
+  }) =>
+    request<{
+      requested_bars: number; received_bars: number; pages: number;
+      gaps: number; truncated: boolean; new_samples: number;
+      dataset: DatasetStats; note: string;
+    }>("/api/v1/history/dataset/backfill", {
+      method: "POST", body: JSON.stringify(payload),
+    }),
+  evaluateDataset: (payload: { market: Market; exchange: Exchange; symbol: string; timeframe: string }) => {
+    const query = new URLSearchParams(payload);
+    return request<{
+      status: "evaluated" | "insufficient_data";
+      train_count: number; test_count: number;
+      rule_name?: string; majority_class_from_train?: string;
+      rule_baseline?: { count: number; accuracy: number; balanced_accuracy: number; macro_f1: number };
+      train_majority_baseline?: { count: number; accuracy: number; balanced_accuracy: number; macro_f1: number };
+      note: string;
+    }>("/api/v1/history/dataset/evaluation?" + query.toString());
+  },
   datasetStats: (payload: { market?: Market; exchange?: Exchange; symbol?: string; timeframe?: string } = {}) => {
     const query = new URLSearchParams(
       Object.entries(payload).filter((entry): entry is [string, string] => Boolean(entry[1])),

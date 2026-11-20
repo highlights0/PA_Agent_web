@@ -36,6 +36,15 @@ const samples = ref<SegmentSample[]>([]);
 const similar = ref<SegmentSample[]>([]);
 const loading = ref(false);
 const building = ref(false);
+const backfilling = ref(false);
+const evaluating = ref(false);
+const backfillCount = ref(3000);
+const evaluation = ref<{
+  status: string; train_count: number; test_count: number;
+  rule_baseline?: { accuracy: number; balanced_accuracy: number; macro_f1: number };
+  train_majority_baseline?: { accuracy: number; balanced_accuracy: number; macro_f1: number };
+  note: string;
+} | null>(null);
 const error = ref("");
 const notice = ref("");
 
@@ -156,6 +165,42 @@ async function buildDataset() {
     error.value = err instanceof Error ? err.message : "构建历史样本失败";
   } finally {
     building.value = false;
+  }
+}
+
+async function backfillHistory() {
+  if (props.market !== "usdm" || props.exchange !== "gate") return;
+  backfilling.value = true;
+  error.value = "";
+  notice.value = "";
+  try {
+    const result = await api.backfillDataset({
+      market: "usdm", exchange: "gate",
+      symbol: props.symbol, timeframe: props.timeframe,
+      bars: backfillCount.value,
+    });
+    stats.value = result.dataset;
+    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本。`;
+    const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
+    samples.value = refreshed.items;
+    evaluation.value = null;
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "历史回补失败";
+  } finally {
+    backfilling.value = false;
+  }
+}
+
+async function evaluateBaseline() {
+  evaluating.value = true;
+  error.value = "";
+  try {
+    evaluation.value = await api.evaluateDataset(datasetQuery.value);
+    notice.value = evaluation.value.note;
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "基线评估失败";
+  } finally {
+    evaluating.value = false;
   }
 }
 
@@ -319,6 +364,35 @@ onMounted(() => void refreshHistory());
               {{ building ? "构建中…" : "构建历史样本" }}
             </button>
           </div>
+          <div v-if="market === 'usdm' && exchange === 'gate'" class="history-dataset-actions">
+            <label class="history-backfill-count">
+              <span>回补 K 线</span>
+              <select v-model.number="backfillCount">
+                <option :value="1000">1000 根</option>
+                <option :value="3000">3000 根</option>
+                <option :value="6000">6000 根</option>
+                <option :value="12000">12000 根</option>
+              </select>
+            </label>
+            <button class="secondary-button" :disabled="backfilling" @click="backfillHistory">
+              {{ backfilling ? "历史分页回补中…" : "Gate 历史分页回补" }}
+            </button>
+          </div>
+          <div class="history-dataset-actions">
+            <button class="secondary-button" :disabled="evaluating" @click="evaluateBaseline">
+              {{ evaluating ? "评估中…" : "评估固定规则基线" }}
+            </button>
+          </div>
+          <section v-if="evaluation" class="history-subsection">
+            <h3>独立测试集表现（非 AI 两阶段准确率）</h3>
+            <p>训练样本 {{ evaluation.train_count }} · 测试样本 {{ evaluation.test_count }}</p>
+            <div v-if="evaluation.status === 'evaluated'" class="history-dataset-metrics">
+              <div><small>固定规则准确率</small><strong>{{ ((evaluation.rule_baseline?.accuracy ?? 0) * 100).toFixed(1) }}%</strong></div>
+              <div><small>训练集多数类基线</small><strong>{{ ((evaluation.train_majority_baseline?.accuracy ?? 0) * 100).toFixed(1) }}%</strong></div>
+              <div><small>规则 Macro F1</small><strong>{{ (evaluation.rule_baseline?.macro_f1 ?? 0).toFixed(3) }}</strong></div>
+            </div>
+            <p class="history-dataset-note">{{ evaluation.note }}</p>
+          </section>
           <div v-if="stats" class="history-dataset-metrics">
             <div><small>样本数</small><strong>{{ stats.sample_count }}</strong></div>
             <div><small>特征版本</small><strong>{{ stats.feature_schema_version }}</strong></div>

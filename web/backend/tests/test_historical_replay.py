@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -312,3 +313,62 @@ def test_analysis_service_rejects_gapped_historical_window(
                 BASE_TIME_MS + 71 * 60_000,
             )
         )
+
+
+
+def test_existing_derivatives_database_migrates_without_guessing_historical_availability(tmp_path: Path):
+    database = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database) as db:
+        db.execute(
+            """
+            CREATE TABLE derivatives_observations (
+                market TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                period TEXT NOT NULL DEFAULT '',
+                event_time_ms INTEGER NOT NULL,
+                fetched_at_ms INTEGER NOT NULL,
+                data_kind TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                raw_json TEXT NOT NULL,
+                source_endpoint TEXT NOT NULL,
+                quality TEXT NOT NULL DEFAULT 'ok',
+                PRIMARY KEY (
+                    market, exchange, symbol, metric, period, event_time_ms, data_kind
+                )
+            )
+            """
+        )
+        base = (
+            "usdm", "binance", "BTCUSDT", "funding_rate", "",
+            1_000, 9_000, "{}", "{}", "/fapi/v1/fundingRate", "ok",
+        )
+        db.execute(
+            """
+            INSERT INTO derivatives_observations (
+                market, exchange, symbol, metric, period, event_time_ms,
+                fetched_at_ms, data_kind, value_json, raw_json, source_endpoint, quality
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'historical', ?, ?, ?, ?)
+            """,
+            base,
+        )
+        db.execute(
+            """
+            INSERT INTO derivatives_observations (
+                market, exchange, symbol, metric, period, event_time_ms,
+                fetched_at_ms, data_kind, value_json, raw_json, source_endpoint, quality
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'snapshot', ?, ?, ?, ?)
+            """,
+            ("usdm", "binance", "BTCUSDT", "open_interest", "", 8_000, 9_000,
+             "{}", "{}", "/context", "ok"),
+        )
+
+    store = AnalysisHistoryStore(database)
+    rows = store.list_derivatives_observations(
+        market="usdm", exchange="binance", symbol="BTCUSDT", limit=10
+    )
+    historical = next(item for item in rows if item["data_kind"] == "historical")
+    snapshot = next(item for item in rows if item["data_kind"] == "snapshot")
+    assert historical["available_at_ms"] == 0
+    assert snapshot["available_at_ms"] == 9_000

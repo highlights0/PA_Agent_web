@@ -14,6 +14,7 @@ import {
   type MarketCandleArchiveStats,
   type DerivativesCollectionReport,
   type DerivativesArchiveStats,
+  type HistoricalReplayJob,
 } from "./api";
 
 const props = defineProps<{
@@ -45,6 +46,13 @@ const derivativesPeriod = ref("15m");
 const derivativesReport = ref<DerivativesCollectionReport | null>(null);
 const derivativesArchive = ref<DerivativesArchiveStats[]>([]);
 const derivativesBusy = ref(false);
+const replayStart = ref("");
+const replayEnd = ref("");
+const replayPoints = ref(3);
+const replayAnalysisBars = ref(100);
+const replayJob = ref<HistoricalReplayJob | null>(null);
+const replaying = ref(false);
+let replayPollTimer: ReturnType<typeof setTimeout> | undefined;
 const batchSymbolsInput = ref("");
 const batchTimeframes = ref<string[]>(props.exchange === "coinbase" ? ["15m", "1h", "6h"] : ["15m", "1h", "4h"]);
 const batchBars = ref(3000);
@@ -81,6 +89,12 @@ const derivativesMetricEntries = computed(() =>
   Object.entries(derivativesReport.value?.metrics ?? {}),
 );
 
+const replayProgress = computed(() =>
+  replayJob.value && replayJob.value.total > 0
+    ? Math.round((replayJob.value.completed / replayJob.value.total) * 100)
+    : 0,
+);
+
 const batchTimeframeOptions = computed(() => {
   if (props.exchange === "coinbase") return ["1m", "5m", "15m", "1h", "6h", "1d"];
   if (props.exchange === "gate") return ["1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"];
@@ -108,6 +122,8 @@ watch(
     derivativesPeriod.value = props.exchange === "gate" ? "15m" : "15m";
     derivativesReport.value = null;
     derivativesArchive.value = [];
+    replayJob.value = null;
+    if (replayPollTimer) clearTimeout(replayPollTimer);
     void refreshDerivativesArchive();
   },
 );
@@ -324,6 +340,62 @@ async function backfillDerivativesHistory() {
   }
 }
 
+function initializeReplayDateRange() {
+  const now = new Date();
+  replayEnd.value = toLocalDateTimeInput(new Date(now.getTime() - 60 * 60 * 1000));
+  replayStart.value = toLocalDateTimeInput(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
+}
+
+async function pollHistoricalReplay(jobId: string) {
+  try {
+    const job = await api.getHistoricalReplay(jobId);
+    replayJob.value = job;
+    if (job.status === "queued" || job.status === "running") {
+      replayPollTimer = setTimeout(() => void pollHistoricalReplay(jobId), 1200);
+      return;
+    }
+    replaying.value = false;
+    await refreshHistory();
+    const succeeded = job.results.filter((item) => item.status === "completed").length;
+    const failed = job.results.length - succeeded;
+    notice.value = `历史 AI 回放结束：成功 ${succeeded}/${job.total}，失败 ${failed}。每个时点的完整 Prompt、模型调用和结果已保存到分析历史。`;
+  } catch (err) {
+    replaying.value = false;
+    error.value = err instanceof Error ? err.message : "读取历史回放进度失败";
+  }
+}
+
+async function startHistoricalReplay() {
+  const startMs = new Date(replayStart.value).getTime();
+  const endMs = new Date(replayEnd.value).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    error.value = "请检查历史回放的起止时间。";
+    return;
+  }
+  replaying.value = true;
+  replayJob.value = null;
+  error.value = "";
+  notice.value = "";
+  if (replayPollTimer) clearTimeout(replayPollTimer);
+  try {
+    const job = await api.startHistoricalReplay({
+      market: props.market,
+      exchange: props.exchange,
+      symbol: props.symbol,
+      timeframe: props.timeframe,
+      analysis_bars: replayAnalysisBars.value,
+      start_ms: startMs,
+      end_ms: endMs,
+      points: replayPoints.value,
+    });
+    replayJob.value = job;
+    void pollHistoricalReplay(job.job_id);
+  } catch (err) {
+    replaying.value = false;
+    error.value = err instanceof Error ? err.message : "启动历史 AI 回放失败";
+  }
+}
+
 async function pollBatchBackfill(jobId: string) {
   try {
     const job = await api.getBatchBackfill(jobId);
@@ -391,6 +463,7 @@ async function startBatchBackfill() {
 
 onBeforeUnmount(() => {
   if (batchPollTimer) clearTimeout(batchPollTimer);
+  if (replayPollTimer) clearTimeout(replayPollTimer);
 });
 
 async function evaluateBaseline() {
@@ -419,6 +492,7 @@ async function loadSimilar() {
 
 onMounted(() => {
   initializeDerivativesDateRange();
+  initializeReplayDateRange();
   void refreshHistory();
   void refreshDerivativesArchive();
 });
@@ -702,6 +776,71 @@ onMounted(() => {
               <article v-for="item in derivativesArchive" :key="item.metric + item.period + item.data_kind" class="history-sample-item">
                 <div><strong>{{ item.metric }} · {{ item.period || "事件数据" }}</strong><span>{{ item.data_kind }}</span></div>
                 <p>{{ item.record_count }} 条 · {{ formatTime(item.oldest_event_time_ms) }} 至 {{ formatTime(item.newest_event_time_ms) }}</p>
+              </article>
+            </div>
+          </section>
+          <section class="history-subsection">
+            <h3>PA Agent 历史 AI 回放</h3>
+            <p>在已归档行情中选取历史收盘时点，调用当前 PA 两阶段分析器重新分析。不会请求实时行情、不会读取未来标签，也不会执行真实交易。</p>
+            <div class="history-dataset-actions">
+              <label class="ai-field">
+                <span>回放开始时间（本地时区）</span>
+                <input v-model="replayStart" type="datetime-local" :disabled="replaying" />
+              </label>
+              <label class="ai-field">
+                <span>回放结束时间（本地时区）</span>
+                <input v-model="replayEnd" type="datetime-local" :disabled="replaying" />
+              </label>
+              <label class="ai-field">
+                <span>回放时点数量</span>
+                <select v-model.number="replayPoints" :disabled="replaying">
+                  <option :value="1">1 个时点</option>
+                  <option :value="3">3 个时点</option>
+                  <option :value="5">5 个时点</option>
+                  <option :value="10">10 个时点</option>
+                  <option :value="20">20 个时点</option>
+                </select>
+              </label>
+              <label class="ai-field">
+                <span>分析 K 线数量</span>
+                <select v-model.number="replayAnalysisBars" :disabled="replaying">
+                  <option :value="50">50 根</option>
+                  <option :value="100">100 根</option>
+                  <option :value="150">150 根</option>
+                  <option :value="200">200 根</option>
+                  <option :value="250">250 根</option>
+                </select>
+              </label>
+              <button class="primary-button" :disabled="replaying" @click="startHistoricalReplay">
+                {{ replaying ? "历史 AI 回放中…" : "开始历史 AI 回放" }}
+              </button>
+            </div>
+            <p class="history-dataset-note">系统会自动从所选时间范围内挑选有足够连续历史 K 线的收盘边界。每个时点都会真实调用已配置的 AI 模型，可能产生 API 费用；单批最多 20 个时点。</p>
+            <div v-if="replayJob" class="history-subsection">
+              <div class="history-section-heading">
+                <strong>回放进度</strong>
+                <span>{{ replayJob.completed }} / {{ replayJob.total }} · {{ replayProgress }}%</span>
+              </div>
+              <progress :value="replayJob.completed" :max="replayJob.total" style="width: 100%" />
+              <p v-if="replayJob.current">
+                当前时点：{{ formatTime(replayJob.current.decision_time_ms) }}（第 {{ replayJob.current.index }} 项）
+              </p>
+              <p v-else>任务状态：{{ replayJob.status === "completed" ? "全部完成" : replayJob.status === "partial" ? "部分完成" : replayJob.status === "failed" ? "全部失败" : "排队中" }}</p>
+              <article
+                v-for="item in replayJob.results"
+                :key="item.analysis_id"
+                class="history-sample-item"
+              >
+                <div>
+                  <strong>{{ formatTime(item.decision_time_ms) }}</strong>
+                  <span>{{ item.status === "completed" ? "完成" : "失败" }}</span>
+                </div>
+                <p v-if="item.status === 'completed'">
+                  阶段一：{{ item.stage1_diagnosis?.direction ?? item.stage1_diagnosis?.cycle_position ?? "已生成" }} ·
+                  阶段二：{{ item.stage2_decision?.direction ?? item.stage2_decision?.order_type ?? "已生成" }}
+                </p>
+                <p v-else>{{ item.error }}</p>
+                <small v-if="item.usage">Token：{{ item.usage.total_tokens ?? "--" }}</small>
               </article>
             </div>
           </section>

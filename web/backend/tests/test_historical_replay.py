@@ -372,3 +372,43 @@ def test_existing_derivatives_database_migrates_without_guessing_historical_avai
     snapshot = next(item for item in rows if item["data_kind"] == "snapshot")
     assert historical["available_at_ms"] == 0
     assert snapshot["available_at_ms"] == 9_000
+
+
+
+def test_asof_derivatives_query_returns_latest_eligible_rows_when_limited(tmp_path: Path):
+    store = AnalysisHistoryStore(tmp_path / "history.sqlite3")
+    observations = []
+    for index in range(3):
+        event_time = (index + 1) * 1_000
+        observations.append(
+            {
+                "market": "usdm",
+                "exchange": "binance",
+                "symbol": "BTCUSDT",
+                "metric": "open_interest",
+                "period": "15m",
+                "event_time_ms": event_time,
+                "fetched_at_ms": 99_000,
+                "available_at_ms": event_time + 900_000,
+                "data_kind": "historical",
+                "value": {"sum_open_interest": str(100 + index)},
+                "raw": {},
+                "source_endpoint": "/futures/data/openInterestHist",
+                "quality": "ok",
+            }
+        )
+    store.upsert_derivatives_observations(observations)
+
+    result = store.list_derivatives_observations_asof(
+        market="usdm",
+        exchange="binance",
+        symbol="BTCUSDT",
+        decision_time_ms=1_000_000,
+        period="15m",
+        limit=1,
+    )
+
+    assert result["eligible_count"] == 3
+    assert result["returned_count"] == 1
+    assert result["truncated"] is True
+    assert result["items"][0]["value"]["sum_open_interest"] == "102"

@@ -157,6 +157,14 @@ class AnalysisService:
         historical_similarity: list[dict[str, Any]] = []
         if self._history_store is not None:
             try:
+                await asyncio.to_thread(
+                    self._history_store.upsert_market_candles,
+                    market=market,
+                    exchange=exchange,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candles=rows,
+                )
                 samples = build_segment_samples(
                     rows,
                     market=market,

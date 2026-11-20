@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -466,7 +467,7 @@ async def backfill_derivatives_history(
     request: Request,
 ):
     symbol = _symbol(payload.symbol)
-    now_ms = int(__import__("time").time() * 1000)
+    now_ms = int(time.time() * 1000)
     if payload.end_ms < payload.start_ms:
         raise HTTPException(status_code=422, detail="结束时间不能早于开始时间")
     if payload.end_ms > now_ms:
@@ -519,9 +520,9 @@ async def backfill_derivatives_history(
 @router.get("/history/derivatives")
 async def list_derivatives_history(
     request: Request,
-    market: Literal["usdm"] = "usdm",
     exchange: Literal["binance", "gate"],
     symbol: str,
+    market: Literal["usdm"] = "usdm",
     start_ms: int | None = None,
     end_ms: int | None = None,
     metric: str | None = None,
@@ -571,9 +572,9 @@ async def get_derivatives_archive_stats(
 @router.get("/history/derivatives/runs")
 async def list_derivatives_collection_runs(
     request: Request,
-    market: Literal["usdm"] = "usdm",
     exchange: Literal["binance", "gate"],
     symbol: str,
+    market: Literal["usdm"] = "usdm",
     limit: int = Query(default=20, ge=1, le=100),
 ):
     return {

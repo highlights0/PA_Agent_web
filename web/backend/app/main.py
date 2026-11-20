@@ -23,6 +23,7 @@ from app.core.public_quota import PublicAnalysisQuota
 from app.services.ai_provider_store import AIProviderStore
 from app.services.analysis_jobs import AnalysisJobStore
 from app.services.analysis_history_store import AnalysisHistoryStore
+from app.services.backfill_jobs import BackfillJobStore
 from app.services.market_service import MarketService
 from app.services.provider_registry import ProviderRegistry
 
@@ -75,6 +76,9 @@ async def lifespan(app: FastAPI):
     )
     app.state.analysis_jobs = AnalysisJobStore()
     app.state.analysis_tasks = set()
+    app.state.backfill_jobs = BackfillJobStore()
+    app.state.backfill_tasks = set()
+    app.state.backfill_semaphore = asyncio.Semaphore(1)
     app.state.analysis_quota = PublicAnalysisQuota(settings.public_analysis_per_ip_daily)
     app.state.analysis_semaphore = asyncio.Semaphore(
         max(1, settings.public_max_concurrent_analyses)

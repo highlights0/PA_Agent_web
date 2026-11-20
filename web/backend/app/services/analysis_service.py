@@ -252,6 +252,18 @@ class AnalysisService:
                 market_type=market,
                 **derivatives.model_dump(),
             )
+            if self._history_store is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._history_store.save_derivatives_snapshot,
+                        market=market,
+                        exchange=exchange,
+                        symbol=symbol,
+                        context=derivatives.model_dump(),
+                        source_endpoint=f"/api/v1/market/usdm/{symbol}/context",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to persist derivatives context snapshot")
             trace.emit(
                 "derivatives_context_loaded",
                 stage="market",

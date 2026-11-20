@@ -1,6 +1,8 @@
 """Public multi-exchange market-data API. No trading or account endpoints."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 from typing import Literal
 
@@ -9,7 +11,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from app.adapters.binance.client import BinanceAPIError
 from app.adapters.binance.models import MarketType
 from app.services.provider_registry import UnsupportedMarketProvider
+from app.services.segmenter import build_segment_samples
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 _INTERVALS = {
     "1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h",
@@ -106,9 +110,25 @@ async def get_klines(
             detail=f"limit exceeds server maximum ({request.app.state.settings.max_klines})",
         )
     try:
-        return await _service(request).klines(
-            market, _validate_symbol(symbol), interval, limit, exchange
+        normalized_symbol = _validate_symbol(symbol)
+        rows = await _service(request).klines(
+            market, normalized_symbol, interval, limit, exchange
         )
+        samples = build_segment_samples(
+            rows,
+            market=market,
+            exchange=exchange,
+            symbol=normalized_symbol,
+            timeframe=interval,
+        )
+        if samples:
+            try:
+                await asyncio.to_thread(
+                    request.app.state.history_store.upsert_segments, samples
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to persist historical PA segment samples")
+        return rows
     except Exception as exc:
         raise _provider_error(exchange, exc) from exc
 

@@ -90,6 +90,9 @@ export interface AnalysisRunDetails {
   stage2_decision: Record<string, any> | null;
   usage: Record<string, number>;
   exception: Record<string, any> | null;
+  chart_findings?: Record<string, any>;
+  provenance?: Record<string, any>;
+  historical_similarity?: Array<Record<string, any>>;
 }
 
 export interface AnalysisJobSnapshot {
@@ -130,6 +133,84 @@ export interface AnalysisResult {
   details?: AnalysisRunDetails;
 }
 
+
+
+export interface AnalysisHistoryItem {
+  id: string;
+  status: string;
+  market: Market;
+  exchange: Exchange;
+  symbol: string;
+  timeframe: string;
+  model_name?: string | null;
+  created_at: string;
+  finished_at?: string | null;
+  cycle_position?: string | null;
+  direction?: string | null;
+  gate_result?: string | null;
+  order_type?: string | null;
+  order_direction?: string | null;
+  entry_price?: number | null;
+  total_tokens?: number | null;
+}
+
+export interface AnalysisHistoryDetail {
+  analysis_id: string;
+  status: string;
+  request: Record<string, any>;
+  result: AnalysisResult | null;
+  trace: AnalysisTraceEvent[];
+  details: AnalysisRunDetails;
+  provenance: Record<string, any>;
+  created_at: string;
+  finished_at?: string | null;
+}
+
+export interface SearchHistoryItem {
+  id: number;
+  query_text: string;
+  market: Market;
+  exchange: Exchange;
+  symbol: string;
+  timeframe: string;
+  created_at: string;
+}
+
+export interface DatasetStats {
+  sample_count: number;
+  label_distribution: Record<string, number>;
+  split_distribution: Record<string, number>;
+  regime_distribution: Record<string, number>;
+  feature_schema_version: string;
+  label_schema_version: string;
+  note: string;
+}
+
+export interface SegmentSample {
+  sample_id: string;
+  market: Market;
+  exchange: Exchange;
+  symbol: string;
+  timeframe: string;
+  regime: string;
+  decision_time_ms: number;
+  segment_start_ms: number;
+  lookback_bars: number;
+  horizon_bars: number;
+  feature_schema_version: string;
+  label_schema_version: string;
+  features: Record<string, number>;
+  labels: Record<string, any>;
+  split: string;
+  embargo_bars: number;
+  similarity?: number;
+}
+
+export interface AnalysisComparison {
+  left: { analysis_id: string; created_at: string; values: Record<string, any> };
+  right: { analysis_id: string; created_at: string; values: Record<string, any> };
+  differences: Record<string, { left: any; right: any }>;
+}
 
 export interface AIProviderPublic {
   id: string;
@@ -271,4 +352,68 @@ export const api = {
       headers: adminToken ? { "X-PA-Admin-Token": adminToken } : {},
       body: JSON.stringify(payload),
     }),
+  saveSearch: (payload: {
+    query_text: string;
+    market: Market;
+    exchange: Exchange;
+    symbol: string;
+    timeframe: string;
+  }) =>
+    request<{ saved: boolean }>("/api/v1/history/searches", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  listSearches: (limit = 50) =>
+    request<{ items: SearchHistoryItem[] }>("/api/v1/history/searches?limit=" + limit),
+  deleteSearch: (id: number) =>
+    request<{ deleted: boolean }>("/api/v1/history/searches/" + id, { method: "DELETE" }),
+  listAnalysisHistory: (limit = 50, symbol?: string) =>
+    request<{ items: AnalysisHistoryItem[] }>(
+      "/api/v1/history/analyses?limit=" + limit + (symbol ? "&symbol=" + encodeURIComponent(symbol) : ""),
+    ),
+  getAnalysisHistory: (id: string) =>
+    request<AnalysisHistoryDetail>("/api/v1/history/analyses/" + encodeURIComponent(id)),
+  compareAnalysisHistory: (leftId: string, rightId: string) =>
+    request<AnalysisComparison>(
+      "/api/v1/history/analyses/compare?left_id=" + encodeURIComponent(leftId) +
+      "&right_id=" + encodeURIComponent(rightId),
+    ),
+  deleteAnalysisHistory: (id: string) =>
+    request<{ deleted: boolean }>("/api/v1/history/analyses/" + encodeURIComponent(id), { method: "DELETE" }),
+  buildHistoricalDataset: (payload: {
+    market: Market; exchange: Exchange; symbol: string; timeframe: string; limit: number;
+  }) =>
+    request<{ requested_bars: number; received_bars: number; closed_bars: number; new_samples: number; dataset: DatasetStats; note: string }>(
+      "/api/v1/history/dataset/build",
+      { method: "POST", body: JSON.stringify(payload) },
+    ),
+  datasetStats: (payload: { market?: Market; exchange?: Exchange; symbol?: string; timeframe?: string } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(payload).filter((entry): entry is [string, string] => Boolean(entry[1])),
+    );
+    return request<DatasetStats>("/api/v1/history/dataset/stats?" + query.toString());
+  },
+  listDatasetSamples: (payload: {
+    market?: Market; exchange?: Exchange; symbol?: string; timeframe?: string; split?: string; limit?: number;
+  } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(payload).filter((entry): entry is [string, string] => entry[1] !== undefined && entry[1] !== null)
+        .map(([key, value]) => [key, String(value)]),
+    );
+    return request<{ items: SegmentSample[] }>("/api/v1/history/dataset/samples?" + query.toString());
+  },
+  similarSegments: (payload: {
+    market: Market; exchange: Exchange; symbol: string; timeframe: string; limit?: number;
+  }) => {
+    const query = new URLSearchParams({
+      market: payload.market,
+      exchange: payload.exchange,
+      symbol: payload.symbol,
+      timeframe: payload.timeframe,
+      limit: String(payload.limit ?? 5),
+    });
+    return request<{ current: Record<string, any> | null; items: SegmentSample[]; note: string }>(
+      "/api/v1/history/dataset/similar?" + query.toString(),
+    );
+  },
 };

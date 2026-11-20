@@ -99,6 +99,18 @@ Multiple provider profiles can be saved; the active profile is used by both stag
 - Public AI analysis remains disabled by default in production; set `PUBLIC_ANALYSIS_ENABLED=true` only after protecting the service and setting suitable quotas. In local development, saving an active AI profile enables analysis automatically.
 - The current quota is an in-memory per-IP UTC-day counter and is suitable only for single-process staging, not a multi-replica public launch.
 
+## Persistent analysis history and historical PA dataset
+
+- SQLite history is stored at `web/backend/data/pa_history.sqlite3` by default; override with `PA_HISTORY_DATABASE_PATH`. The directory is gitignored and is persisted by the Docker `pa-agent-data` volume.
+- Analysis history saves the request, structured Stage 1/Stage 2 result, safe trace, market context, provider/model identifier (never the API key), and prompt/strategy/code SHA-256 provenance. Search history stores symbol/market/exchange/timeframe queries. Analysis and search records are scoped by a hash of the requesting IP; this is a single-operator convenience boundary, not a substitute for authentication on a public multi-user deployment.
+- The Web UI includes a **历史记录** drawer with analysis history, search history, structured comparisons, dataset statistics, sample browsing, and a historical sample build action.
+- Market K-line queries automatically seed a deduplicated sample set; **构建历史样本** can request up to 1000 bars (Coinbase is capped at 300 per request). This is a bounded recent-history seed, not full-history pagination/backfill yet.
+- Dataset feature schema: `pa-segment-features-v1`; label schema: `forward-outcome-v1`. A feature vector uses only the trailing 24 closed bars at its decision timestamp. Future 12-bar return, maximum favorable/adverse excursion, and up/down/flat label are stored separately in `labels_json`; those labels are never included in feature vectors or sent to the AI prompt.
+- Samples are generated for each eligible closed-bar timestamp and carry an as-of regime classification (bullish/bearish trend, range, breakout, reversal, trend-end candidate, or mixed). These are deterministic heuristic labels, not a supervised model's learned classifications.
+- Temporal split is chronological 60/20/20 with a 12-bar embargo at boundaries. Small datasets are marked `unassigned`; they are not represented as train/validation/test.
+- Similar-history retrieval uses a transparent weighted feature-distance score and is shown as reference data only. It is not a probability, accuracy score, or model training. LLM fine-tuning and predictive model training are deliberately deferred until the dataset is sufficiently large and reviewed.
+- Historical sample labels are retrospective outcomes and must not be used as input features. Any future model evaluation must keep time-ordered holdouts and report metrics separately from label distributions.
+
 No exchange account access, order, cancel, transfer, or withdrawal endpoints are implemented.
 
 ## Local development (Windows CMD)

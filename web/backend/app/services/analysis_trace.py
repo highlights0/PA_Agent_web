@@ -359,6 +359,7 @@ class AnalysisTrace:
         )
         return {
             "provider": {
+                "provider_id": provider.get("provider_id"),
                 "name": _safe_text(provider.get("name") or "", 100),
                 "model": _safe_text(provider.get("model") or "", 120),
                 "base_url": _safe_text(safe_base_url, 160),

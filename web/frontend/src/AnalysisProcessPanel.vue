@@ -3,9 +3,13 @@ import { computed, ref } from "vue";
 import type { AnalysisJobSnapshot, AnalysisTraceEvent } from "./api";
 
 const props = defineProps<{ job: AnalysisJobSnapshot | null }>();
-const emit = defineEmits<{ close: [] }>();
+const emit = defineEmits<{
+  close: [];
+  "highlight-level": [level: string, kind: "support" | "resistance"];
+  "highlight-bars": [barFrom: number, barTo: number];
+}>();
 
-type Tab = "timeline" | "stage1" | "validation" | "stage2" | "market" | "trace";
+type Tab = "timeline" | "stage1" | "validation" | "stage2" | "market" | "provenance" | "trace";
 const activeTab = ref<Tab>("timeline");
 
 const tabs: Array<{ id: Tab; label: string }> = [
@@ -14,6 +18,7 @@ const tabs: Array<{ id: Tab; label: string }> = [
   { id: "validation", label: "校验与重试" },
   { id: "stage2", label: "阶段二" },
   { id: "market", label: "输入数据" },
+  { id: "provenance", label: "版本溯源" },
   { id: "trace", label: "调试记录" },
 ];
 
@@ -61,6 +66,13 @@ const stage1Prompt = computed(() => details.value?.prompts?.stage1 ?? trace.valu
   .find((item) => item.type === "prompt_ready" && item.stage === "stage1")?.data ?? null);
 const stage2Prompt = computed(() => details.value?.prompts?.stage2 ?? trace.value
   .find((item) => item.type === "prompt_ready" && item.stage === "stage2")?.data ?? null);
+const stage1Diagnosis = computed(() => details.value?.stage1_diagnosis ?? stage1Output.value ?? {});
+const chartFindings = computed(() => details.value?.chart_findings ?? {
+  support_levels: stage1Diagnosis.value?.support_levels ?? [],
+  resistance_levels: stage1Diagnosis.value?.resistance_levels ?? [],
+  bar_by_bar_summary: stage1Diagnosis.value?.bar_by_bar_summary ?? [],
+  gate_trace: stage1Diagnosis.value?.gate_trace ?? [],
+});
 const strategyFiles = computed(() => {
   if (details.value?.strategy_files_used) return details.value.strategy_files_used;
   const routed = [...trace.value].reverse().find((item) => item.type === "strategy_routed");
@@ -98,6 +110,22 @@ function eventTone(event: AnalysisTraceEvent) {
 }
 function latestValidation(stage: string) {
   return [...validationItems.value].reverse().find((item) => item.stage === stage) ?? null;
+}
+function highlightBar(bar: unknown) {
+  const match = String(bar ?? "").match(/^K(\d+)$/i);
+  if (!match) return;
+  const seq = Number(match[1]);
+  emit("highlight-bars", seq, seq);
+}
+function highlightNode(node: Record<string, any>) {
+  const from = Number(node.bar_from);
+  const to = Number(node.bar_to);
+  if (Number.isFinite(from) && Number.isFinite(to) && from > 0 && to > 0) {
+    emit("highlight-bars", from, to);
+    return;
+  }
+  const match = String(node.bar_range ?? "").match(/^K(\d+)(?:-K(\d+))?$/i);
+  if (match) emit("highlight-bars", Number(match[1]), Number(match[2] ?? match[1]));
 }
 </script>
 
@@ -209,6 +237,47 @@ function latestValidation(stage: string) {
                   <span v-for="heading in stage1Prompt.user_headings" :key="heading">{{ heading }}</span>
                 </div>
               </div>
+            </div>
+            <div v-if="chartFindings.support_levels?.length || chartFindings.resistance_levels?.length" class="analysis-subsection">
+              <h4>支撑 / 阻力价位 · 点击定位图表</h4>
+              <div class="analysis-chip-list">
+                <button
+                  v-for="level in chartFindings.support_levels || []"
+                  :key="'support-' + level"
+                  class="analysis-click-chip support"
+                  @click="emit('highlight-level', level, 'support')"
+                >支撑 {{ level }}</button>
+                <button
+                  v-for="level in chartFindings.resistance_levels || []"
+                  :key="'resistance-' + level"
+                  class="analysis-click-chip resistance"
+                  @click="emit('highlight-level', level, 'resistance')"
+                >阻力 {{ level }}</button>
+              </div>
+            </div>
+            <div v-if="chartFindings.bar_by_bar_summary?.length" class="analysis-subsection">
+              <h4>逐 K 线摘要 · 点击定位</h4>
+              <button
+                v-for="item in chartFindings.bar_by_bar_summary"
+                :key="item.bar"
+                class="analysis-bar-link"
+                @click="highlightBar(item.bar)"
+              >
+                <strong>{{ item.bar }} · {{ item.role }}</strong>
+                <span>{{ item.reason }}</span>
+              </button>
+            </div>
+            <div v-if="chartFindings.gate_trace?.length" class="analysis-subsection">
+              <h4>闸门决策树 · 点击定位 K 线范围</h4>
+              <button
+                v-for="node in chartFindings.gate_trace"
+                :key="node.node_id"
+                class="analysis-bar-link"
+                @click="highlightNode(node)"
+              >
+                <strong>{{ node.node_id }} · {{ node.question }}</strong>
+                <span>{{ node.answer }} · {{ node.bar_range }} · {{ node.reason }}</span>
+              </button>
             </div>
             <pre v-if="stage1Output" class="analysis-json">{{ pretty(stage1Output) }}</pre>
             <div v-else class="analysis-empty-state compact">阶段一结构化诊断尚未生成。</div>
@@ -341,6 +410,39 @@ function latestValidation(stage: string) {
               </div>
             </template>
             <div v-else class="analysis-empty-state compact">市场数据准备完成后，会在这里显示本次输入摘要。</div>
+          </section>
+
+          <section v-else-if="activeTab === 'provenance'" class="analysis-tab-content">
+            <div class="analysis-section-heading">
+              <div>
+                <h3>Prompt / 策略版本溯源</h3>
+                <p>记录本次实际加载或路由的文件及 SHA-256，便于复现实验。</p>
+              </div>
+            </div>
+            <template v-if="details?.provenance">
+              <div class="analysis-subsection">
+                <h4>Prompt 与策略文件</h4>
+                <div v-for="file in details.provenance.prompt_files || []" :key="file.path" class="analysis-provenance-row">
+                  <strong>{{ file.path }}</strong>
+                  <code>{{ file.sha256 || "文件缺失" }}</code>
+                  <small>{{ file.kind }} · {{ file.size_bytes ?? "--" }} bytes</small>
+                </div>
+              </div>
+              <div class="analysis-subsection">
+                <h4>PA 核心引擎文件</h4>
+                <div v-for="file in details.provenance.engine_files || []" :key="file.path" class="analysis-provenance-row">
+                  <strong>{{ file.path }}</strong>
+                  <code>{{ file.sha256 || "文件缺失" }}</code>
+                  <small>{{ file.size_bytes ?? "--" }} bytes</small>
+                </div>
+              </div>
+              <div class="analysis-chip-list">
+                <span>Feature {{ details.provenance.feature_schema_version }}</span>
+                <span>Label {{ details.provenance.label_schema_version }}</span>
+                <span>Model {{ details.provenance.model }}</span>
+              </div>
+            </template>
+            <div v-else class="analysis-empty-state compact">当前分析尚未记录 Prompt 文件版本。</div>
           </section>
 
           <section v-else class="analysis-tab-content">

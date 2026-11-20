@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from app.core.config import Settings as WebSettings
 from app.services.crypto_context import CryptoMarketContext, render_crypto_context
 from app.services.crypto_prompt_assembler import CryptoPromptAssembler
 from app.services.analysis_trace import AnalysisTrace, TracingClient, TracingValidator
+from app.services.segmenter import build_current_features, build_segment_samples
 
 logger = logging.getLogger("pa_crypto.analysis")
 
@@ -62,10 +64,12 @@ class AnalysisService:
         market_service: Any,
         web_settings: WebSettings,
         provider_store: Any | None = None,
+        history_store: Any | None = None,
     ) -> None:
         self._market = market_service
         self._web_settings = web_settings
         self._provider_store = provider_store
+        self._history_store = history_store
 
     def _active_provider(self) -> dict[str, Any]:
         if self._provider_store is not None:
@@ -73,6 +77,7 @@ class AnalysisService:
             if saved and saved.get("api_key"):
                 return {
                     "name": saved.get("name", "AI Provider"),
+                    "provider_id": saved.get("id"),
                     "model": saved["model"],
                     "base_url": saved["base_url"],
                     "api_key": saved["api_key"],
@@ -86,6 +91,7 @@ class AnalysisService:
         if self._web_settings.ai_api_key.strip():
             return {
                 "name": "Environment provider",
+                "provider_id": None,
                 "model": self._web_settings.ai_model,
                 "base_url": self._web_settings.ai_base_url,
                 "api_key": self._web_settings.ai_api_key,
@@ -148,6 +154,48 @@ class AnalysisService:
             detail=f"收到 {len(rows)} 根，已收盘 {len(core_bars)} 根",
             data={"received_bars": len(rows), "closed_bars": len(core_bars)},
         )
+        historical_similarity: list[dict[str, Any]] = []
+        if self._history_store is not None:
+            try:
+                samples = build_segment_samples(
+                    rows,
+                    market=market,
+                    exchange=exchange,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
+                if samples:
+                    await asyncio.to_thread(self._history_store.upsert_segments, samples)
+                current_features = build_current_features(rows)
+                if current_features is not None and self._web_settings.historical_similarity_enabled:
+                    historical_similarity = await asyncio.to_thread(
+                        self._history_store.similar_segments,
+                        market=market,
+                        exchange=exchange,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        features=current_features,
+                        before_ms=current_features["decision_time_ms"],
+                        limit=5,
+                    )
+                    trace.emit(
+                        "historical_similarity_ready",
+                        stage="history",
+                        title="历史相似行情检索完成",
+                        detail=f"找到 {len(historical_similarity)} 个历史样本；仅供人工参考，不作为模型训练标签输入",
+                        data={
+                            "sample_ids": [item["sample_id"] for item in historical_similarity],
+                            "similarities": [item["similarity"] for item in historical_similarity],
+                        },
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception("Historical sample indexing/retrieval failed; continuing PA analysis")
+                trace.emit(
+                    "historical_dataset_warning",
+                    stage="history",
+                    title="历史样本库暂不可用",
+                    detail="本次 PA 分析继续执行；历史样本保存/检索失败，请检查 SQLite 数据库",
+                )
         from pa_agent.data.snapshot import build_analysis_frame
 
         frame = build_analysis_frame(
@@ -242,9 +290,21 @@ class AnalysisService:
                 },
             )
 
-        return await asyncio.to_thread(
+        run = await asyncio.to_thread(
             self._run_sync, frame, context, provider_config, trace
         )
+        run.details["historical_similarity"] = [
+            {
+                "sample_id": item["sample_id"],
+                "regime": item["regime"],
+                "similarity": item["similarity"],
+                "decision_time_ms": item["decision_time_ms"],
+                "labels": item["labels"],
+                "split": item["split"],
+            }
+            for item in historical_similarity
+        ]
+        return run
 
     def _run_sync(
         self,
@@ -282,12 +342,23 @@ class AnalysisService:
         settings.prompt.experience_max_entries = 0
 
         experience_reader = ExperienceReader(experience_dir=Path(EXPERIENCE_DIR))
+        prompt_dir = Path(PROMPT_DIR)
         assembler = CryptoPromptAssembler(
-            prompt_dir=Path(PROMPT_DIR),
+            prompt_dir=prompt_dir,
             experience_reader=experience_reader,
             prompt_settings=settings.prompt,
             crypto_context_text=render_crypto_context(context),
         )
+        loaded_prompt_names: set[str] = set()
+        original_load = assembler._load
+
+        def tracked_load(filename: str) -> str:
+            loaded_prompt_names.add(filename)
+            return original_load(filename)
+
+        # Instrument only the per-run assembler instance. The original PA prompt
+        # construction and caching behavior remain unchanged.
+        assembler._load = tracked_load
         client = TracingClient(
             DeepSeekClient(settings.provider, logger_=logger),
             trace,
@@ -339,6 +410,70 @@ class AnalysisService:
             context=context,
             record=record,
             provider=provider_config,
+        )
+        stage1 = record.stage1_diagnosis or {}
+        details["chart_findings"] = {
+            "support_levels": list(stage1.get("support_levels") or []),
+            "resistance_levels": list(stage1.get("resistance_levels") or []),
+            "bar_by_bar_summary": list(stage1.get("bar_by_bar_summary") or []),
+            "gate_trace": list(stage1.get("gate_trace") or []),
+        }
+        from pa_agent.ai import prompt_assembler as prompt_module
+        prompt_files = set(loaded_prompt_names)
+        # The shared system prompt is process-cached; include its declared source
+        # files and the fixed Stage 1 / Stage 2 task files even on cache hits.
+        for constant_name in (
+            "COMMON_SYSTEM_PROMPT_TXT_FILES",
+            "STAGE1_TASK_PROMPT_TXT_FILES",
+            "STAGE2_BASE_PROMPT_TXT_FILES",
+        ):
+            prompt_files.update(getattr(prompt_module, constant_name, ()) or ())
+        prompt_files.update(record.strategy_files_used or [])
+        project_root = prompt_dir.parent
+        def file_digest(path: Path) -> dict[str, Any]:
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                return {"path": str(path.relative_to(project_root)) if path.is_relative_to(project_root) else path.name, "available": False}
+            return {
+                "path": str(path.relative_to(project_root)) if path.is_relative_to(project_root) else path.name,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size_bytes": len(raw),
+                "available": True,
+            }
+        prompt_provenance = []
+        for filename in sorted(prompt_files):
+            candidate = (prompt_dir / filename).resolve()
+            if prompt_dir.resolve() not in candidate.parents:
+                continue
+            entry = file_digest(candidate)
+            entry["kind"] = "strategy" if filename in (record.strategy_files_used or []) else "prompt"
+            prompt_provenance.append(entry)
+        engine_paths = [
+            project_root / "pa_agent/ai/prompt_assembler.py",
+            project_root / "pa_agent/ai/router.py",
+            project_root / "pa_agent/ai/prompts/schemas.py",
+            project_root / "pa_agent/ai/json_validator.py",
+            project_root / "pa_agent/orchestrator/two_stage.py",
+        ]
+        details["provenance"] = {
+            "prompt_files": prompt_provenance,
+            "engine_files": [file_digest(path) for path in engine_paths],
+            "strategy_files_used": list(record.strategy_files_used or []),
+            "provider_id": provider_config.get("provider_id"),
+            "model": provider_config.get("model"),
+            "feature_schema_version": "pa-segment-features-v1",
+            "label_schema_version": "forward-outcome-v1",
+        }
+        trace.emit(
+            "prompt_provenance_captured",
+            stage="history",
+            title="本次 Prompt 与策略版本已记录",
+            detail=f"{len(prompt_provenance)} 个实际加载/路由文件，{len(engine_paths)} 个核心引擎文件",
+            data={
+                "prompt_files": prompt_provenance,
+                "engine_files": details["provenance"]["engine_files"],
+            },
         )
         if details["stage2_short_circuited"]:
             trace.emit(

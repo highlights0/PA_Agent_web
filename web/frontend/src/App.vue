@@ -5,6 +5,8 @@ import {
   api,
   type AnalysisResult,
   type AnalysisJobSnapshot,
+  type AnalysisHistoryDetail,
+  type SearchHistoryItem,
   type Exchange,
   type FuturesContext,
   type FuturesExchange,
@@ -14,6 +16,7 @@ import {
 } from "./api";
 import AISettingsPanel from "./AISettingsPanel.vue";
 import AnalysisProcessPanel from "./AnalysisProcessPanel.vue";
+import HistoryPanel from "./HistoryPanel.vue";
 
 const market = ref<Market>("spot");
 const exchange = ref<Exchange>("coinbase");
@@ -25,6 +28,8 @@ const futuresContext = ref<FuturesContext | null>(null);
 const analysis = ref<AnalysisResult | null>(null);
 const analysisJob = ref<AnalysisJobSnapshot | null>(null);
 const showAnalysisProcess = ref(false);
+const showHistoryPanel = ref(false);
+const selectedChartLevel = ref<string | null>(null);
 const loading = ref(false);
 const contextLoading = ref(false);
 const analysisLoading = ref(false);
@@ -39,6 +44,7 @@ let resizeObserver: ResizeObserver | null = null;
 let refreshTimer: number | undefined;
 let contextTimer: number | undefined;
 let pollActive = true;
+let analysisPriceLines: any[] = [];
 
 const changePositive = computed(() => Number(ticker.value?.price_change_percent ?? 0) >= 0);
 const diagnosis = computed<Record<string, any>>(() => analysis.value?.stage1_diagnosis ?? {});
@@ -49,6 +55,111 @@ const exchangeLabel = computed(() => ({
   coinbase: "Coinbase Exchange Spot",
   gate: "Gate.io USDT Perpetual",
 }[exchange.value]));
+
+function parseLevelPrice(raw: unknown): number | null {
+  const matches = String(raw ?? "").match(/\d+(?:\.\d+)?/g);
+  if (!matches?.length) return null;
+  const values = matches.slice(0, 2).map(Number).filter((value) => Number.isFinite(value) && value > 0);
+  if (!values.length) return null;
+  return values.length === 2 ? (values[0] + values[1]) / 2 : values[0];
+}
+
+function clearAnalysisOverlays() {
+  if (candleSeries) {
+    for (const line of analysisPriceLines) {
+      try { candleSeries.removePriceLine(line); } catch { /* chart may already be disposed */ }
+    }
+    candleSeries.setMarkers([]);
+  }
+  analysisPriceLines = [];
+}
+
+function renderAnalysisOverlays() {
+  if (!candleSeries || !klines.value.length) return;
+  clearAnalysisOverlays();
+  const levels = [
+    ...(Array.isArray(diagnosis.value.support_levels) ? diagnosis.value.support_levels : [])
+      .map((label: string) => ({ label, kind: "support" })),
+    ...(Array.isArray(diagnosis.value.resistance_levels) ? diagnosis.value.resistance_levels : [])
+      .map((label: string) => ({ label, kind: "resistance" })),
+  ];
+  for (const level of levels) {
+    const price = parseLevelPrice(level.label);
+    if (price === null) continue;
+    const selected = selectedChartLevel.value === level.kind + ":" + level.label;
+    analysisPriceLines.push(candleSeries.createPriceLine({
+      price,
+      color: level.kind === "support" ? (selected ? "#4ade80" : "#168b66") : (selected ? "#fb7185" : "#b45360"),
+      lineWidth: selected ? 3 : 1,
+      lineStyle: selected ? 0 : 2,
+      axisLabelVisible: true,
+      title: (level.kind === "support" ? "支撑 " : "阻力 ") + level.label,
+    }));
+  }
+
+  const markers: any[] = [];
+  const summaries = Array.isArray(diagnosis.value.bar_by_bar_summary)
+    ? diagnosis.value.bar_by_bar_summary
+    : [];
+  for (const item of summaries) {
+    const match = String(item?.bar ?? "").match(/^K(\d+)$/i);
+    if (!match) continue;
+    const seq = Number(match[1]);
+    const closedCount = klines.value.filter((item) => item.closed).length;
+    const index = closedCount - seq;
+    const bar = klines.value[index];
+    if (!bar || index < 0) continue;
+    const isBull = String(item.context_effect ?? "").includes("bull");
+    const isBear = String(item.context_effect ?? "").includes("bear");
+    markers.push({
+      time: Math.floor(bar.open_time / 1000) as any,
+      position: item.role === "signal" || item.role === "entry" ? "belowBar" : "aboveBar",
+      color: isBull ? "#4ade80" : isBear ? "#fb7185" : "#fbbf24",
+      shape: item.role === "signal" ? "arrowUp" : item.role === "trap" ? "square" : "circle",
+      text: String(item.bar) + " " + String(item.role ?? ""),
+    });
+  }
+  candleSeries.setMarkers(markers);
+}
+
+function highlightPriceLevel(raw: string, kind: "support" | "resistance") {
+  selectedChartLevel.value = kind + ":" + raw;
+  renderAnalysisOverlays();
+  const price = parseLevelPrice(raw);
+  if (price !== null && chart) {
+    chart.priceScale("right").applyOptions({ autoScale: true });
+    chart.timeScale().fitContent();
+  }
+}
+
+function highlightBarRange(barFrom: number, barTo = barFrom) {
+  if (!chart || !klines.value.length) return;
+  const older = Math.max(1, Math.max(barFrom, barTo));
+  const newer = Math.max(1, Math.min(barFrom, barTo));
+  const lastIndex = klines.value.filter((item) => item.closed).length - 1;
+  if (lastIndex < 0) return;
+  const from = Math.max(0, lastIndex - older - 3);
+  const to = Math.min(lastIndex, lastIndex - newer + 3);
+  chart.timeScale().setVisibleLogicalRange({ from, to });
+}
+
+function onSelectHistoricalAnalysis(detail: AnalysisHistoryDetail) {
+  if (!detail.result) return;
+  analysis.value = detail.result;
+  analysisError.value = "";
+  selectedChartLevel.value = null;
+  void nextTick(() => renderAnalysisOverlays());
+}
+
+function restoreHistoricalSearch(item: SearchHistoryItem) {
+  market.value = item.market;
+  exchange.value = item.exchange;
+  symbol.value = item.symbol;
+  interval.value = item.timeframe;
+  analysis.value = null;
+  showHistoryPanel.value = false;
+  queryMarket();
+}
 
 function createMarketChart() {
   if (!chartHost.value || chart) return;
@@ -102,6 +213,7 @@ async function loadMarket() {
         })),
       );
       chart?.timeScale().fitContent();
+      renderAnalysisOverlays();
     }
   } catch (err) {
     error.value = err instanceof Error ? err.message : "行情加载失败";
@@ -174,6 +286,27 @@ async function runAnalysis() {
 }
 
 function queryMarket() {
+  const normalized = symbol.value.trim().toUpperCase();
+  if (analysis.value && (
+    analysis.value.symbol !== normalized
+    || analysis.value.market !== market.value
+    || analysis.value.exchange !== exchange.value
+    || analysis.value.timeframe !== interval.value
+  )) {
+    analysis.value = null;
+    selectedChartLevel.value = null;
+  }
+  if (!/^[A-Z0-9_-]{3,32}$/.test(normalized)) {
+    error.value = "交易对格式不正确";
+    return;
+  }
+  void api.saveSearch({
+    query_text: normalized,
+    market: market.value,
+    exchange: exchange.value,
+    symbol: normalized,
+    timeframe: interval.value,
+  }).catch(() => undefined);
   void loadMarket();
   void loadFuturesContext();
 }
@@ -236,11 +369,14 @@ function formatTimestamp(value: number | undefined | null) {
 
 watch(interval, () => {
   analysis.value = null;
-  void loadMarket();
+  queryMarket();
+});
+watch(analysis, () => {
+  selectedChartLevel.value = null;
+  void nextTick(() => renderAnalysisOverlays());
 });
 onMounted(() => {
-  void loadMarket();
-  void loadFuturesContext();
+  queryMarket();
   refreshTimer = window.setInterval(() => void loadMarket(), 15_000);
   contextTimer = window.setInterval(() => void loadFuturesContext(), 60_000);
 });
@@ -274,6 +410,13 @@ onBeforeUnmount(() => {
         >
           <span>☷</span> 分析过程
           <i v-if="analysisLoading" class="process-live-dot"></i>
+        </button>
+        <button
+          class="process-menu-button"
+          :class="{ active: showHistoryPanel }"
+          @click="showHistoryPanel = !showHistoryPanel"
+        >
+          <span>◷</span> 历史记录
         </button>
         <button class="settings-button" @click="showAiSettings = true">
           <span>⚙</span> AI 模型设置
@@ -448,6 +591,21 @@ onBeforeUnmount(() => {
           <div class="analysis-row"><span>闸门结果</span><strong>{{ diagnosis.gate_result || "--" }}</strong></div>
           <div class="analysis-row"><span>风险警示</span><strong>{{ diagnosis.risk_warning || "--" }}</strong></div>
           <p v-if="diagnosis.market_summary" class="analysis-text">{{ diagnosis.market_summary }}</p>
+          <div v-if="diagnosis.support_levels?.length || diagnosis.resistance_levels?.length" class="chart-level-links">
+            <span class="chart-level-heading">图表关键价位（点击定位）</span>
+            <button
+              v-for="level in diagnosis.support_levels || []"
+              :key="'s-' + level"
+              class="chart-level-chip support"
+              @click="highlightPriceLevel(level, 'support')"
+            >支撑 {{ level }}</button>
+            <button
+              v-for="level in diagnosis.resistance_levels || []"
+              :key="'r-' + level"
+              class="chart-level-chip resistance"
+              @click="highlightPriceLevel(level, 'resistance')"
+            >阻力 {{ level }}</button>
+          </div>
         </article>
         <article class="analysis-card">
           <h3>阶段二 · 交易决策</h3>
@@ -506,6 +664,18 @@ onBeforeUnmount(() => {
       v-if="showAnalysisProcess"
       :job="analysisJob"
       @close="showAnalysisProcess = false"
+      @highlight-level="highlightPriceLevel"
+      @highlight-bars="highlightBarRange"
+    />
+    <HistoryPanel
+      v-if="showHistoryPanel"
+      :market="market"
+      :exchange="exchange"
+      :symbol="symbol"
+      :timeframe="interval"
+      @close="showHistoryPanel = false"
+      @restore-search="restoreHistoricalSearch"
+      @select-analysis="onSelectHistoricalAnalysis"
     />
     <AISettingsPanel
       v-if="showAiSettings"

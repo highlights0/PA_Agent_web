@@ -45,6 +45,11 @@ class Settings:
         "AI_PROVIDER_STORE_PATH",
         str(Path(__file__).resolve().parents[2] / "data" / "ai_providers.json"),
     )
+    history_database_path: str = os.getenv(
+        "PA_HISTORY_DATABASE_PATH",
+        str(Path(__file__).resolve().parents[2] / "data" / "pa_history.sqlite3"),
+    )
+    historical_similarity_enabled: bool = _bool_env("PA_HISTORICAL_SIMILARITY_ENABLED", True)
     ai_settings_master_key: str = os.getenv("AI_SETTINGS_MASTER_KEY", "")
     ai_settings_admin_token: str = os.getenv("AI_SETTINGS_ADMIN_TOKEN", "")
     public_analysis_enabled: bool = _bool_env("PUBLIC_ANALYSIS_ENABLED", False)

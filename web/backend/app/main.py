@@ -17,10 +17,12 @@ from app.adapters.gate.futures_rest import GateFuturesREST
 from app.api.v1.analysis import router as analysis_router
 from app.api.v1.ai_settings import router as ai_settings_router
 from app.api.v1.market import router as market_router
+from app.api.v1.history import router as history_router
 from app.core.config import settings
 from app.core.public_quota import PublicAnalysisQuota
 from app.services.ai_provider_store import AIProviderStore
 from app.services.analysis_jobs import AnalysisJobStore
+from app.services.analysis_history_store import AnalysisHistoryStore
 from app.services.market_service import MarketService
 from app.services.provider_registry import ProviderRegistry
 
@@ -59,6 +61,7 @@ async def lifespan(app: FastAPI):
         settings.ai_provider_store_path,
         master_key=settings.ai_settings_master_key or None,
     )
+    history_store = AnalysisHistoryStore(settings.history_database_path)
 
     from app.services.analysis_service import AnalysisService
 
@@ -66,8 +69,9 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.market_service = market_service
     app.state.ai_provider_store = ai_provider_store
+    app.state.history_store = history_store
     app.state.analysis_service = AnalysisService(
-        market_service, settings, ai_provider_store
+        market_service, settings, ai_provider_store, history_store
     )
     app.state.analysis_jobs = AnalysisJobStore()
     app.state.analysis_tasks = set()
@@ -122,3 +126,4 @@ async def binance_error_handler(request, exc: BinanceAPIError):
 app.include_router(market_router, prefix="/api/v1")
 app.include_router(analysis_router, prefix="/api/v1")
 app.include_router(ai_settings_router, prefix="/api/v1")
+app.include_router(history_router, prefix="/api/v1")

@@ -197,16 +197,24 @@ async def start_analysis_job(payload: AnalysisRequest, request: Request):
 
     try:
         remaining = _consume_quota(request)
-        job = request.app.state.analysis_jobs.create(
-            _client_ip(request),
-            {
-                "market": payload.market,
-                "exchange": payload.exchange,
-                "symbol": symbol,
-                "timeframe": payload.timeframe,
-                "analysis_bars": payload.analysis_bars,
-            },
-        )
+        request_data = {
+            "market": payload.market,
+            "exchange": payload.exchange,
+            "symbol": symbol,
+            "timeframe": payload.timeframe,
+            "analysis_bars": payload.analysis_bars,
+        }
+        job = request.app.state.analysis_jobs.create(_client_ip(request), request_data)
+        try:
+            request.app.state.history_store.save_analysis(
+                analysis_id=job["job_id"],
+                owner=_client_ip(request),
+                request_data=request_data,
+                status="queued",
+                created_at=job["created_at"],
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to persist queued analysis history")
         task = asyncio.create_task(
             _execute_analysis_job(
                 request,
@@ -215,6 +223,7 @@ async def start_analysis_job(payload: AnalysisRequest, request: Request):
                 symbol,
                 remaining,
                 semaphore,
+                job["created_at"],
             )
         )
         request.app.state.analysis_tasks.add(task)
@@ -232,6 +241,7 @@ async def _execute_analysis_job(
     symbol: str,
     remaining: int,
     semaphore: asyncio.Semaphore,
+    created_at: str,
 ) -> None:
     store = request.app.state.analysis_jobs
     store.set_running(job_id)
@@ -257,15 +267,51 @@ async def _execute_analysis_job(
             details=run.details,
             trace=run.trace,
         )
+        try:
+            request.app.state.history_store.save_analysis(
+                analysis_id=job_id,
+                owner=_client_ip(request),
+                request_data={
+                    "market": payload.market,
+                    "exchange": payload.exchange,
+                    "symbol": symbol,
+                    "timeframe": payload.timeframe,
+                    "analysis_bars": payload.analysis_bars,
+                },
+                status=result["status"],
+                result=result,
+                trace=run.trace,
+                details=run.details,
+                created_at=created_at,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to persist completed analysis history")
     except Exception as exc:  # noqa: BLE001
         error = _translate_analysis_error(exc)
-        store.fail(
-            job_id,
-            {
-                "status_code": error.status_code,
-                "message": _safe_text(error.detail),
-            },
-        )
+        failure = {
+            "status_code": error.status_code,
+            "message": _safe_text(error.detail),
+        }
+        store.fail(job_id, failure)
+        try:
+            request.app.state.history_store.save_analysis(
+                analysis_id=job_id,
+                owner=_client_ip(request),
+                request_data={
+                    "market": payload.market,
+                    "exchange": payload.exchange,
+                    "symbol": symbol,
+                    "timeframe": payload.timeframe,
+                    "analysis_bars": payload.analysis_bars,
+                },
+                status="failed",
+                result={"analysis_id": job_id, "status": "failed", "error": failure},
+                trace=(store.get(job_id, _client_ip(request)) or {}).get("trace", []),
+                details={},
+                created_at=created_at,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to persist failed analysis history")
     finally:
         semaphore.release()
 

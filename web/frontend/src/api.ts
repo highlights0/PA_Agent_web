@@ -266,7 +266,7 @@ export interface BatchBackfillResult {
 
 export interface BatchBackfillJob {
   job_id: string;
-  status: "queued" | "running" | "completed" | "failed";
+  status: "queued" | "running" | "completed" | "partial" | "failed";
   total: number;
   completed: number;
   current: {
@@ -281,6 +281,39 @@ export interface BatchBackfillJob {
   created_at: string;
   updated_at: string;
   finished_at: string | null;
+}
+
+export interface HistoricalReplayResult {
+  status: "completed" | "failed";
+  analysis_id: string;
+  decision_time_ms: number;
+  stage1_diagnosis?: Record<string, any> | null;
+  stage2_decision?: Record<string, any> | null;
+  usage?: Record<string, number>;
+  error?: string;
+}
+
+export interface HistoricalReplayJob {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "partial" | "failed";
+  total: number;
+  completed: number;
+  current: {
+    market: Market;
+    exchange: Exchange;
+    symbol: string;
+    timeframe: string;
+    analysis_bars: number;
+    decision_time_ms: number;
+    index: number;
+  } | null;
+  results: HistoricalReplayResult[];
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+  candidate_count?: number;
+  selected_points?: number;
+  note?: string;
 }
 
 export interface SegmentSample {
@@ -518,6 +551,18 @@ export const api = {
       "/api/v1/history/candles/stats?" + query.toString(),
     );
   },
+  startHistoricalReplay: (payload: {
+    market: Market; exchange: Exchange; symbol: string; timeframe: string;
+    analysis_bars: number; start_ms: number; end_ms: number; points: number;
+  }) =>
+    request<HistoricalReplayJob>("/api/v1/history/replay", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  getHistoricalReplay: (jobId: string) =>
+    request<HistoricalReplayJob>(
+      "/api/v1/history/replay/" + encodeURIComponent(jobId),
+    ),
   backfillDerivatives: (payload: {
     market: "usdm"; exchange: FuturesExchange; symbol: string;
     period: string; start_ms: number; end_ms: number;

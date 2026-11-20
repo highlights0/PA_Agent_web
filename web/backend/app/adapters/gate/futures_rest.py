@@ -110,6 +110,48 @@ class GateFuturesREST:
             },
         )
 
+    async def funding_rate_history_range(
+        self,
+        symbol: str,
+        *,
+        from_s: int,
+        to_s: int,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if from_s < 0 or to_s < from_s:
+            raise ValueError("Invalid Gate funding history time range")
+        return await self._client.get(
+            "/futures/usdt/funding_rate",
+            {
+                "contract": self.contract_name(symbol),
+                "from": int(from_s),
+                "to": int(to_s),
+                "limit": min(max(int(limit), 1), 100),
+            },
+        )
+
+    async def contract_stats_range(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        from_s: int,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if interval not in {"5m", "15m", "30m", "1h", "4h", "8h", "1d"}:
+            raise ValueError(f"Unsupported Gate contract-stats interval: {interval}")
+        if from_s < 0:
+            raise ValueError("Invalid Gate contract-stats start time")
+        return await self._client.get(
+            "/futures/usdt/contract_stats",
+            {
+                "contract": self.contract_name(symbol),
+                "from": int(from_s),
+                "interval": interval,
+                "limit": min(max(int(limit), 1), 200),
+            },
+        )
+
     async def contract_stats(
         self,
         symbol: str,

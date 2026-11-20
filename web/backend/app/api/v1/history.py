@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.ai_settings import _authorize
 from app.services.historical_backfill import backfill_market_candles
+from app.services.derivatives_history import collect_derivatives_history
 from app.services.baseline_evaluation import evaluate_rule_baseline
 from app.services.segmenter import build_current_features, build_segment_samples
 
@@ -220,6 +221,16 @@ class BackfillInput(BaseModel):
 class BatchBackfillInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     jobs: list[BackfillInput] = Field(min_length=1, max_length=24)
+
+
+class DerivativesBackfillInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    market: Literal["usdm"] = "usdm"
+    exchange: Literal["binance", "gate"]
+    symbol: str = Field(min_length=3, max_length=32)
+    period: str = Field(default="15m", min_length=2, max_length=8)
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
 
 
 @router.post("/history/dataset/backfill")
@@ -447,6 +458,133 @@ async def get_batch_backfill(job_id: str, request: Request):
     if job is None:
         raise HTTPException(status_code=404, detail="批量回补任务不存在或已过期")
     return job
+
+
+@router.post("/history/derivatives/backfill")
+async def backfill_derivatives_history(
+    payload: DerivativesBackfillInput,
+    request: Request,
+):
+    symbol = _symbol(payload.symbol)
+    now_ms = int(__import__("time").time() * 1000)
+    if payload.end_ms < payload.start_ms:
+        raise HTTPException(status_code=422, detail="结束时间不能早于开始时间")
+    if payload.end_ms > now_ms:
+        raise HTTPException(status_code=422, detail="历史回补结束时间不能晚于当前时间")
+    if payload.end_ms - payload.start_ms > 366 * 24 * 60 * 60 * 1000:
+        raise HTTPException(status_code=422, detail="单次衍生品历史回补范围不能超过 366 天")
+
+    try:
+        result = await collect_derivatives_history(
+            request.app.state.market_service,
+            exchange=payload.exchange,
+            symbol=symbol,
+            period=payload.period,
+            start_ms=payload.start_ms,
+            end_ms=payload.end_ms,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"衍生品历史回补参数不受支持：{str(exc)[:240]}") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"衍生品历史回补失败：{str(exc)[:240]}") from exc
+
+    history = _history(request)
+    stored = await asyncio.to_thread(
+        history.upsert_derivatives_observations,
+        result["observations"],
+    )
+    run = {
+        key: value
+        for key, value in result.items()
+        if key not in {"observations", "observation_count"}
+    }
+    await asyncio.to_thread(history.save_derivatives_collection_run, run)
+    return {
+        "run_id": result["run_id"],
+        "market": result["market"],
+        "exchange": result["exchange"],
+        "symbol": result["symbol"],
+        "period": result["period"],
+        "start_time_ms": result["start_time_ms"],
+        "end_time_ms": result["end_time_ms"],
+        "fetched_at_ms": result["fetched_at_ms"],
+        "status": result["status"],
+        "observation_count": result["observation_count"],
+        "stored_observations": stored,
+        "metrics": result["metrics"],
+        "note": result["note"],
+    }
+
+
+@router.get("/history/derivatives")
+async def list_derivatives_history(
+    request: Request,
+    market: Literal["usdm"] = "usdm",
+    exchange: Literal["binance", "gate"],
+    symbol: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    metric: str | None = None,
+    period: str | None = None,
+    data_kind: Literal["historical", "snapshot"] | None = None,
+    limit: int = Query(default=5000, ge=1, le=50000),
+):
+    if start_ms is not None and start_ms < 0:
+        raise HTTPException(status_code=422, detail="start_ms 不能小于 0")
+    if end_ms is not None and end_ms < 0:
+        raise HTTPException(status_code=422, detail="end_ms 不能小于 0")
+    if start_ms is not None and end_ms is not None and end_ms < start_ms:
+        raise HTTPException(status_code=422, detail="结束时间不能早于开始时间")
+    return {
+        "items": await asyncio.to_thread(
+            _history(request).list_derivatives_observations,
+            market=market,
+            exchange=exchange,
+            symbol=_symbol(symbol),
+            start_ms=start_ms,
+            end_ms=end_ms,
+            metric=metric,
+            period=period,
+            data_kind=data_kind,
+            limit=limit,
+        )
+    }
+
+
+@router.get("/history/derivatives/stats")
+async def get_derivatives_archive_stats(
+    request: Request,
+    market: Literal["usdm"] = "usdm",
+    exchange: Literal["binance", "gate"] | None = None,
+    symbol: str | None = None,
+):
+    return {
+        "items": await asyncio.to_thread(
+            _history(request).derivatives_archive_stats,
+            market=market,
+            exchange=exchange,
+            symbol=_symbol(symbol) if symbol else None,
+        )
+    }
+
+
+@router.get("/history/derivatives/runs")
+async def list_derivatives_collection_runs(
+    request: Request,
+    market: Literal["usdm"] = "usdm",
+    exchange: Literal["binance", "gate"],
+    symbol: str,
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    return {
+        "items": await asyncio.to_thread(
+            _history(request).list_derivatives_collection_runs,
+            market=market,
+            exchange=exchange,
+            symbol=_symbol(symbol),
+            limit=limit,
+        )
+    }
 
 
 @router.get("/history/candles/stats")

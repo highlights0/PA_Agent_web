@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   api,
   type AnalysisComparison,
@@ -10,6 +10,11 @@ import {
   type SearchHistoryItem,
   type SegmentSample,
   type DatasetStats,
+  type BatchBackfillJob,
+  type MarketCandleArchiveStats,
+  type DerivativesCollectionReport,
+  type DerivativesArchiveStats,
+  type HistoricalReplayJob,
 } from "./api";
 
 const props = defineProps<{
@@ -34,6 +39,26 @@ const comparison = ref<AnalysisComparison | null>(null);
 const stats = ref<DatasetStats | null>(null);
 const samples = ref<SegmentSample[]>([]);
 const similar = ref<SegmentSample[]>([]);
+const candleArchive = ref<MarketCandleArchiveStats | null>(null);
+const derivativesStart = ref("");
+const derivativesEnd = ref("");
+const derivativesPeriod = ref("15m");
+const derivativesReport = ref<DerivativesCollectionReport | null>(null);
+const derivativesArchive = ref<DerivativesArchiveStats[]>([]);
+const derivativesBusy = ref(false);
+const replayStart = ref("");
+const replayEnd = ref("");
+const replayPoints = ref(3);
+const replayAnalysisBars = ref(100);
+const replayJob = ref<HistoricalReplayJob | null>(null);
+const replaying = ref(false);
+let replayPollTimer: ReturnType<typeof setTimeout> | undefined;
+const batchSymbolsInput = ref("");
+const batchTimeframes = ref<string[]>(props.exchange === "coinbase" ? ["15m", "1h", "6h"] : ["15m", "1h", "4h"]);
+const batchBars = ref(3000);
+const batchJob = ref<BatchBackfillJob | null>(null);
+const batching = ref(false);
+let batchPollTimer: ReturnType<typeof setTimeout> | undefined;
 const loading = ref(false);
 const building = ref(false);
 const backfilling = ref(false);
@@ -54,6 +79,54 @@ const datasetQuery = computed(() => ({
   symbol: props.symbol,
   timeframe: props.timeframe,
 }));
+
+const derivativesPeriodOptions = computed(() =>
+  props.exchange === "gate"
+    ? ["5m", "15m", "30m", "1h", "4h", "8h", "1d"]
+    : ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"],
+);
+const derivativesMetricEntries = computed(() =>
+  Object.entries(derivativesReport.value?.metrics ?? {}),
+);
+
+const replayProgress = computed(() =>
+  replayJob.value && replayJob.value.total > 0
+    ? Math.round((replayJob.value.completed / replayJob.value.total) * 100)
+    : 0,
+);
+
+const batchTimeframeOptions = computed(() => {
+  if (props.exchange === "coinbase") return ["1m", "5m", "15m", "1h", "6h", "1d"];
+  if (props.exchange === "gate") return ["1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"];
+  return ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"];
+});
+const defaultBatchSymbols = computed(() =>
+  props.exchange === "coinbase"
+    ? "BTC-USD, ETH-USD"
+    : "BTCUSDT, ETHUSDT, NEARUSDT",
+);
+const batchProgress = computed(() =>
+  batchJob.value && batchJob.value.total > 0
+    ? Math.round((batchJob.value.completed / batchJob.value.total) * 100)
+    : 0,
+);
+
+watch(
+  () => [props.market, props.exchange],
+  () => {
+    batchSymbolsInput.value = "";
+    batchTimeframes.value = props.exchange === "coinbase"
+      ? ["15m", "1h", "6h"]
+      : ["15m", "1h", "4h"];
+    batchJob.value = null;
+    derivativesPeriod.value = props.exchange === "gate" ? "15m" : "15m";
+    derivativesReport.value = null;
+    derivativesArchive.value = [];
+    replayJob.value = null;
+    if (replayPollTimer) clearTimeout(replayPollTimer);
+    void refreshDerivativesArchive();
+  },
+);
 
 function formatTime(value: string | number | null | undefined) {
   if (!value) return "--";
@@ -83,16 +156,18 @@ async function refreshHistory() {
   loading.value = true;
   error.value = "";
   try {
-    const [analysisResult, searchResult, datasetResult, sampleResult] = await Promise.all([
+    const [analysisResult, searchResult, datasetResult, sampleResult, candleResult] = await Promise.all([
       api.listAnalysisHistory(100),
       api.listSearches(100),
       api.datasetStats(datasetQuery.value),
       api.listDatasetSamples({ ...datasetQuery.value, limit: 100 }),
+      api.marketCandleStats(datasetQuery.value),
     ]);
     analyses.value = analysisResult.items;
     searches.value = searchResult.items;
     stats.value = datasetResult;
     samples.value = sampleResult.items;
+    candleArchive.value = candleResult.items[0] ?? null;
   } catch (err) {
     error.value = err instanceof Error ? err.message : "读取历史记录失败";
   } finally {
@@ -106,6 +181,15 @@ async function openAnalysis(item: AnalysisHistoryItem) {
     selectedAnalysis.value = await api.getAnalysisHistory(item.id);
   } catch (err) {
     error.value = err instanceof Error ? err.message : "读取分析详情失败";
+  }
+}
+
+async function openReplayAnalysis(analysisId: string) {
+  error.value = "";
+  try {
+    selectedAnalysis.value = await api.getAnalysisHistory(analysisId);
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "读取回放分析详情失败";
   }
 }
 
@@ -158,8 +242,14 @@ async function buildDataset() {
       limit: props.exchange === "coinbase" ? 300 : 1000,
     });
     stats.value = result.dataset;
-    const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
+    evaluation.value = null;
+    similar.value = [];
+    const [refreshed, archive] = await Promise.all([
+      api.listDatasetSamples({ ...datasetQuery.value, limit: 100 }),
+      api.marketCandleStats(datasetQuery.value),
+    ]);
     samples.value = refreshed.items;
+    candleArchive.value = archive.items[0] ?? null;
     notice.value = `已读取 ${result.received_bars} 根 K 线，新增 ${result.new_samples} 个历史样本。`;
   } catch (err) {
     error.value = err instanceof Error ? err.message : "构建历史样本失败";
@@ -169,27 +259,221 @@ async function buildDataset() {
 }
 
 async function backfillHistory() {
-  if (props.market !== "usdm" || props.exchange !== "gate") return;
   backfilling.value = true;
   error.value = "";
   notice.value = "";
   try {
     const result = await api.backfillDataset({
-      market: "usdm", exchange: "gate",
-      symbol: props.symbol, timeframe: props.timeframe,
+      market: props.market,
+      exchange: props.exchange,
+      symbol: props.symbol,
+      timeframe: props.timeframe,
       bars: backfillCount.value,
     });
     stats.value = result.dataset;
-    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本。`;
-    const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
+    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本；归档总计 ${result.archive_candles} 根。` +
+      (result.truncated ? " 数据源可用历史不足或已达到分页上限。" : "");
+    const [refreshed, archive] = await Promise.all([
+      api.listDatasetSamples({ ...datasetQuery.value, limit: 100 }),
+      api.marketCandleStats(datasetQuery.value),
+    ]);
     samples.value = refreshed.items;
+    candleArchive.value = archive.items[0] ?? null;
     evaluation.value = null;
+    similar.value = [];
   } catch (err) {
     error.value = err instanceof Error ? err.message : "历史回补失败";
   } finally {
     backfilling.value = false;
   }
 }
+
+function toLocalDateTimeInput(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function initializeDerivativesDateRange() {
+  const now = new Date();
+  derivativesEnd.value = toLocalDateTimeInput(now);
+  derivativesStart.value = toLocalDateTimeInput(new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000));
+}
+
+async function refreshDerivativesArchive() {
+  if (props.market !== "usdm" || (props.exchange !== "binance" && props.exchange !== "gate")) {
+    derivativesArchive.value = [];
+    return;
+  }
+  try {
+    const result = await api.derivativesStats({
+      market: "usdm",
+      exchange: props.exchange,
+      symbol: props.symbol,
+    });
+    derivativesArchive.value = result.items;
+  } catch {
+    derivativesArchive.value = [];
+  }
+}
+
+async function backfillDerivativesHistory() {
+  if (props.market !== "usdm" || (props.exchange !== "binance" && props.exchange !== "gate")) return;
+  const startMs = new Date(derivativesStart.value).getTime();
+  const endMs = new Date(derivativesEnd.value).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+    error.value = "请检查衍生品历史采集的起止时间。";
+    return;
+  }
+  derivativesBusy.value = true;
+  error.value = "";
+  derivativesReport.value = null;
+  try {
+    derivativesReport.value = await api.backfillDerivatives({
+      market: "usdm",
+      exchange: props.exchange,
+      symbol: props.symbol,
+      period: derivativesPeriod.value,
+      start_ms: startMs,
+      end_ms: endMs,
+    });
+    await refreshDerivativesArchive();
+    const unavailable = Object.entries(derivativesReport.value.metrics)
+      .filter(([, item]) => item.status === "unavailable")
+      .length;
+    notice.value = `衍生品历史采集完成：写入 ${derivativesReport.value.stored_observations} 条观测记录。` +
+      (unavailable ? `其中 ${unavailable} 项接口不可用，请检查指标状态。` : "");
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "衍生品历史采集失败";
+  } finally {
+    derivativesBusy.value = false;
+  }
+}
+
+function initializeReplayDateRange() {
+  const now = new Date();
+  replayEnd.value = toLocalDateTimeInput(new Date(now.getTime() - 60 * 60 * 1000));
+  replayStart.value = toLocalDateTimeInput(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
+}
+
+async function pollHistoricalReplay(jobId: string) {
+  try {
+    const job = await api.getHistoricalReplay(jobId);
+    replayJob.value = job;
+    if (job.status === "queued" || job.status === "running") {
+      replayPollTimer = setTimeout(() => void pollHistoricalReplay(jobId), 1200);
+      return;
+    }
+    replaying.value = false;
+    await refreshHistory();
+    const succeeded = job.results.filter((item) => item.status === "completed").length;
+    const failed = job.results.length - succeeded;
+    notice.value = `历史 AI 回放结束：成功 ${succeeded}/${job.total}，失败 ${failed}。每个时点的完整 Prompt、模型调用和结果已保存到分析历史。`;
+  } catch (err) {
+    replaying.value = false;
+    error.value = err instanceof Error ? err.message : "读取历史回放进度失败";
+  }
+}
+
+async function startHistoricalReplay() {
+  const startMs = new Date(replayStart.value).getTime();
+  const endMs = new Date(replayEnd.value).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    error.value = "请检查历史回放的起止时间。";
+    return;
+  }
+  replaying.value = true;
+  replayJob.value = null;
+  error.value = "";
+  notice.value = "";
+  if (replayPollTimer) clearTimeout(replayPollTimer);
+  try {
+    const job = await api.startHistoricalReplay({
+      market: props.market,
+      exchange: props.exchange,
+      symbol: props.symbol,
+      timeframe: props.timeframe,
+      analysis_bars: replayAnalysisBars.value,
+      start_ms: startMs,
+      end_ms: endMs,
+      points: replayPoints.value,
+    });
+    replayJob.value = job;
+    void pollHistoricalReplay(job.job_id);
+  } catch (err) {
+    replaying.value = false;
+    error.value = err instanceof Error ? err.message : "启动历史 AI 回放失败";
+  }
+}
+
+async function pollBatchBackfill(jobId: string) {
+  try {
+    const job = await api.getBatchBackfill(jobId);
+    batchJob.value = job;
+    if (job.status === "queued" || job.status === "running") {
+      batchPollTimer = setTimeout(() => void pollBatchBackfill(jobId), 1200);
+      return;
+    }
+    batching.value = false;
+    await refreshHistory();
+    const successful = job.results.filter((item) => item.status === "completed").length;
+    const failed = job.results.length - successful;
+    notice.value = `批量采集完成：成功 ${successful}/${job.total}，失败 ${failed}。已归档数据可在下次任务中续传。`;
+  } catch (err) {
+    batching.value = false;
+    error.value = err instanceof Error ? err.message : "读取批量回补进度失败";
+  }
+}
+
+async function startBatchBackfill() {
+  error.value = "";
+  notice.value = "";
+  const symbols = (batchSymbolsInput.value.trim() || defaultBatchSymbols.value)
+    .split(/[,，;；\s]+/)
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+  const timeframes = [...new Set(batchTimeframes.value)];
+  if (!symbols.length) {
+    error.value = "请至少输入一个交易对。";
+    return;
+  }
+  if (!timeframes.length) {
+    error.value = "请至少选择一个 K 线周期。";
+    return;
+  }
+  const jobs = symbols.flatMap((item) =>
+    timeframes.map((period) => ({
+      market: props.market,
+      exchange: props.exchange,
+      symbol: item,
+      timeframe: period,
+      bars: batchBars.value,
+    })),
+  );
+  if (jobs.length > 24) {
+    error.value = "单批最多支持 24 个交易对与周期组合。";
+    return;
+  }
+  if (jobs.length * batchBars.value > 60000) {
+    error.value = "单批回补总量不能超过 60000 根 K 线，请减少组合或回补数量。";
+    return;
+  }
+  batching.value = true;
+  batchJob.value = null;
+  if (batchPollTimer) clearTimeout(batchPollTimer);
+  try {
+    const job = await api.startBatchBackfill(jobs);
+    batchJob.value = job;
+    void pollBatchBackfill(job.job_id);
+  } catch (err) {
+    batching.value = false;
+    error.value = err instanceof Error ? err.message : "启动批量历史采集失败";
+  }
+}
+
+onBeforeUnmount(() => {
+  if (batchPollTimer) clearTimeout(batchPollTimer);
+  if (replayPollTimer) clearTimeout(replayPollTimer);
+});
 
 async function evaluateBaseline() {
   evaluating.value = true;
@@ -215,7 +499,12 @@ async function loadSimilar() {
   }
 }
 
-onMounted(() => void refreshHistory());
+onMounted(() => {
+  initializeDerivativesDateRange();
+  initializeReplayDateRange();
+  void refreshHistory();
+  void refreshDerivativesArchive();
+});
 </script>
 
 <template>
@@ -364,7 +653,7 @@ onMounted(() => void refreshHistory());
               {{ building ? "构建中…" : "构建历史样本" }}
             </button>
           </div>
-          <div v-if="market === 'usdm' && exchange === 'gate'" class="history-dataset-actions">
+          <div class="history-dataset-actions">
             <label class="history-backfill-count">
               <span>回补 K 线</span>
               <select v-model.number="backfillCount">
@@ -375,9 +664,200 @@ onMounted(() => void refreshHistory());
               </select>
             </label>
             <button class="secondary-button" :disabled="backfilling" @click="backfillHistory">
-              {{ backfilling ? "历史分页回补中…" : "Gate 历史分页回补" }}
+              {{ backfilling ? "历史分页回补中…" : "历史分页回补" }}
             </button>
           </div>
+          <section class="history-subsection">
+            <h3>批量历史采集与断点续传</h3>
+            <p>按当前交易所和市场批量采集多个交易对与周期。已归档的 K 线会去重，重复启动时从最早已归档时间继续向前补齐。</p>
+            <label class="ai-field">
+              <span>交易对（逗号分隔）</span>
+              <input
+                v-model="batchSymbolsInput"
+                :placeholder="defaultBatchSymbols"
+                :disabled="batching"
+              />
+            </label>
+            <div class="history-dataset-actions">
+              <label
+                v-for="period in batchTimeframeOptions"
+                :key="period"
+                class="history-compare-check"
+              >
+                <input
+                  v-model="batchTimeframes"
+                  type="checkbox"
+                  :value="period"
+                  :disabled="batching"
+                />
+                <span>{{ period }}</span>
+              </label>
+            </div>
+            <div class="history-dataset-actions">
+              <label class="history-backfill-count">
+                <span>每个组合目标 K 线数</span>
+                <select v-model.number="batchBars" :disabled="batching">
+                  <option :value="1000">1000 根</option>
+                  <option :value="3000">3000 根</option>
+                  <option :value="6000">6000 根</option>
+                  <option :value="12000">12000 根</option>
+                </select>
+              </label>
+              <button class="primary-button" :disabled="batching" @click="startBatchBackfill">
+                {{ batching ? "批量采集中…" : "开始批量采集" }}
+              </button>
+            </div>
+            <p class="history-dataset-note">默认交易对：{{ defaultBatchSymbols }}。单批最多 24 个组合、总目标不超过 60000 根；任务按顺序执行，避免同时冲击交易所接口。</p>
+            <div v-if="batchJob" class="history-subsection">
+              <div class="history-section-heading">
+                <strong>任务进度</strong>
+                <span>{{ batchJob.completed }} / {{ batchJob.total }} · {{ batchProgress }}%</span>
+              </div>
+              <progress :value="batchJob.completed" :max="batchJob.total" style="width: 100%" />
+              <p v-if="batchJob.current">
+                当前：{{ batchJob.current.symbol }} · {{ batchJob.current.timeframe }}（第 {{ batchJob.current.index }} 项）
+              </p>
+              <p v-else>任务状态：{{ batchJob.status === "completed" ? "已完成" : batchJob.status === "failed" ? "失败" : "排队中" }}</p>
+              <article
+                v-for="item in batchJob.results"
+                :key="item.market + item.exchange + item.symbol + item.timeframe"
+                class="history-sample-item"
+              >
+                <div>
+                  <strong>{{ item.symbol }} · {{ item.timeframe }}</strong>
+                  <span>{{ item.status === "completed" ? "完成" : "失败" }}</span>
+                </div>
+                <p v-if="item.status === 'completed'">
+                  归档 {{ item.archive_candles }} 根 · 本次新增 {{ item.stored_candles }} 根 · 样本新增 {{ item.new_samples }} 个
+                </p>
+                <p v-else>{{ item.error }}</p>
+              </article>
+            </div>
+          </section>
+          <section v-if="candleArchive" class="history-subsection">
+            <h3>原始 K 线归档</h3>
+            <div class="history-dataset-metrics">
+              <div><small>已归档 K 线</small><strong>{{ candleArchive.candle_count }}</strong></div>
+              <div><small>最早时间</small><strong>{{ formatTime(candleArchive.oldest_open_time_ms) }}</strong></div>
+              <div><small>最新时间</small><strong>{{ formatTime(candleArchive.newest_open_time_ms) }}</strong></div>
+            </div>
+            <p class="history-dataset-note">原始 OHLCV 与交易所来源独立保存，可用于后续历史回放；只归档已收盘 K 线。</p>
+          </section>
+          <section v-if="market === 'usdm' && (exchange === 'binance' || exchange === 'gate')" class="history-subsection">
+            <h3>合约衍生品历史数据</h3>
+            <p>采集资金费率、OI、多空比、Taker 比例及可用的爆仓统计。历史数据与实时快照分开保存，不会用实时快照填补历史缺失。</p>
+            <div class="history-dataset-actions">
+              <label class="ai-field">
+                <span>统计周期</span>
+                <select v-model="derivativesPeriod" :disabled="derivativesBusy">
+                  <option v-for="period in derivativesPeriodOptions" :key="period" :value="period">{{ period }}</option>
+                </select>
+              </label>
+              <label class="ai-field">
+                <span>开始时间（本地时区）</span>
+                <input v-model="derivativesStart" type="datetime-local" :disabled="derivativesBusy" />
+              </label>
+              <label class="ai-field">
+                <span>结束时间（本地时区）</span>
+                <input v-model="derivativesEnd" type="datetime-local" :disabled="derivativesBusy" />
+              </label>
+              <button class="primary-button" :disabled="derivativesBusy" @click="backfillDerivativesHistory">
+                {{ derivativesBusy ? "采集中…" : "采集衍生品历史" }}
+              </button>
+            </div>
+            <p class="history-dataset-note">
+              Binance 的 OI、多空比、Taker 和大户统计历史接口通常只提供最近约 30 天；资金费率历史范围更长。Gate 统计按接口支持的时间范围分页。接口没有返回的数据会标记为无记录或不可用。
+            </p>
+            <div v-if="derivativesReport" class="history-subsection">
+              <h4>本次采集结果 · {{ derivativesReport.observation_count }} 条</h4>
+              <div class="history-distributions">
+                <div v-for="[metric, result] in derivativesMetricEntries" :key="metric">
+                  <strong>{{ metric }}</strong>
+                  <span>{{ result.status }} · {{ result.records }} 条</span>
+                  <small v-if="result.effective_start_ms">可查询起点：{{ formatTime(result.effective_start_ms) }}</small>
+                  <small v-if="result.error">{{ result.error }}</small>
+                </div>
+              </div>
+              <p class="history-dataset-note">{{ derivativesReport.note }}</p>
+            </div>
+            <div v-if="derivativesArchive.length" class="history-subsection">
+              <h4>已归档指标</h4>
+              <article v-for="item in derivativesArchive" :key="item.metric + item.period + item.data_kind" class="history-sample-item">
+                <div><strong>{{ item.metric }} · {{ item.period || "事件数据" }}</strong><span>{{ item.data_kind }}</span></div>
+                <p>{{ item.record_count }} 条 · {{ formatTime(item.oldest_event_time_ms) }} 至 {{ formatTime(item.newest_event_time_ms) }}</p>
+              </article>
+            </div>
+          </section>
+          <section class="history-subsection">
+            <h3>PA Agent 历史 AI 回放</h3>
+            <p>在已归档行情中选取历史收盘时点，调用当前 PA 两阶段分析器重新分析。不会请求实时行情、不会读取未来标签，也不会执行真实交易。</p>
+            <div class="history-dataset-actions">
+              <label class="ai-field">
+                <span>回放开始时间（本地时区）</span>
+                <input v-model="replayStart" type="datetime-local" :disabled="replaying" />
+              </label>
+              <label class="ai-field">
+                <span>回放结束时间（本地时区）</span>
+                <input v-model="replayEnd" type="datetime-local" :disabled="replaying" />
+              </label>
+              <label class="ai-field">
+                <span>回放时点数量</span>
+                <select v-model.number="replayPoints" :disabled="replaying">
+                  <option :value="1">1 个时点</option>
+                  <option :value="3">3 个时点</option>
+                  <option :value="5">5 个时点</option>
+                  <option :value="10">10 个时点</option>
+                  <option :value="20">20 个时点</option>
+                </select>
+              </label>
+              <label class="ai-field">
+                <span>分析 K 线数量</span>
+                <select v-model.number="replayAnalysisBars" :disabled="replaying">
+                  <option :value="50">50 根</option>
+                  <option :value="100">100 根</option>
+                  <option :value="150">150 根</option>
+                  <option :value="200">200 根</option>
+                  <option :value="250">250 根</option>
+                </select>
+              </label>
+              <button class="primary-button" :disabled="replaying" @click="startHistoricalReplay">
+                {{ replaying ? "历史 AI 回放中…" : "开始历史 AI 回放" }}
+              </button>
+            </div>
+            <p class="history-dataset-note">系统会自动从所选时间范围内挑选有足够连续历史 K 线的收盘边界。每个时点都会真实调用已配置的 AI 模型，可能产生 API 费用；单批最多 20 个时点。</p>
+            <div v-if="replayJob" class="history-subsection">
+              <div class="history-section-heading">
+                <strong>回放进度</strong>
+                <span>{{ replayJob.completed }} / {{ replayJob.total }} · {{ replayProgress }}%</span>
+              </div>
+              <progress :value="replayJob.completed" :max="replayJob.total" style="width: 100%" />
+              <p v-if="replayJob.current">
+                当前时点：{{ formatTime(replayJob.current.decision_time_ms) }}（第 {{ replayJob.current.index }} 项）
+              </p>
+              <p v-else>任务状态：{{ replayJob.status === "completed" ? "全部完成" : replayJob.status === "partial" ? "部分完成" : replayJob.status === "failed" ? "全部失败" : "排队中" }}</p>
+              <article
+                v-for="item in replayJob.results"
+                :key="item.analysis_id"
+                class="history-sample-item"
+              >
+                <div>
+                  <strong>{{ formatTime(item.decision_time_ms) }}</strong>
+                  <span>{{ item.status === "completed" ? "完成" : "失败" }}</span>
+                </div>
+                <p v-if="item.status === 'completed'">
+                  阶段一：{{ item.stage1_diagnosis?.direction ?? item.stage1_diagnosis?.cycle_position ?? "已生成" }} ·
+                  阶段二：{{ item.stage2_decision?.direction ?? item.stage2_decision?.order_type ?? "已生成" }}
+                </p>
+                <p v-else>{{ item.error }}</p>
+                <small v-if="item.usage">Token：{{ item.usage.total_tokens ?? "--" }}</small>
+                <button
+                  v-if="item.analysis_id"
+                  class="text-action"
+                  @click="openReplayAnalysis(item.analysis_id)"
+                >查看完整分析详情</button>
+              </article>
+            </div>
+          </section>
           <div class="history-dataset-actions">
             <button class="secondary-button" :disabled="evaluating" @click="evaluateBaseline">
               {{ evaluating ? "评估中…" : "评估固定规则基线" }}

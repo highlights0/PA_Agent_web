@@ -137,6 +137,55 @@ class MarketService:
             )
         return normalize_klines(rows, market_type=market, exchange=exchange)
 
+    async def klines_range(
+        self,
+        market: MarketType,
+        symbol: str,
+        interval: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+        limit: int,
+        exchange: str = "binance",
+    ) -> list[KlineDTO]:
+        """Fetch an inclusive open-time range and normalize it like live candles."""
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("Invalid historical candle time range")
+        provider = self._provider(market, exchange)
+        if exchange == "gate":
+            rows = await provider.klines_range(
+                symbol,
+                interval,
+                from_s=start_ms // 1000,
+                to_s=end_ms // 1000,
+            )
+            contract = await provider.contract_info(symbol)
+            multiplier = contract.get("quanto_multiplier")
+            if multiplier is None:
+                raise ValueError("Gate contract metadata is missing quanto_multiplier")
+            return normalize_gate_klines(
+                rows,
+                interval=interval,
+                quanto_multiplier=str(multiplier),
+            )
+        if exchange == "coinbase":
+            rows = await provider.klines_range(
+                symbol,
+                interval,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=min(max(int(limit), 1), 300),
+            )
+            return normalize_coinbase_klines(rows, interval=interval)
+        rows = await provider.klines_range(
+            symbol,
+            interval,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=min(max(int(limit), 1), 1000),
+        )
+        return normalize_klines(rows, market_type=market, exchange=exchange)
+
     async def ticker(
         self, market: MarketType, symbol: str, exchange: str = "binance"
     ) -> TickerDTO:

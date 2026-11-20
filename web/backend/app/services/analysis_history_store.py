@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,8 +111,98 @@ class AnalysisHistoryStore:
                     ON segment_samples(market, exchange, symbol, timeframe, decision_time_ms);
                 CREATE INDEX IF NOT EXISTS idx_segments_split
                     ON segment_samples(split, regime);
+
+                CREATE TABLE IF NOT EXISTS market_candles (
+                    market TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    open_time_ms INTEGER NOT NULL,
+                    close_time_ms INTEGER NOT NULL,
+                    open TEXT NOT NULL,
+                    high TEXT NOT NULL,
+                    low TEXT NOT NULL,
+                    close TEXT NOT NULL,
+                    volume TEXT NOT NULL,
+                    quote_volume TEXT NOT NULL DEFAULT '',
+                    trades INTEGER,
+                    taker_buy_base_volume TEXT NOT NULL DEFAULT '',
+                    taker_buy_quote_volume TEXT NOT NULL DEFAULT '',
+                    volume_unit TEXT NOT NULL DEFAULT 'base_asset',
+                    contract_volume TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (market, exchange, symbol, timeframe, open_time_ms)
+                );
+                CREATE INDEX IF NOT EXISTS idx_market_candles_instrument_time
+                    ON market_candles(market, exchange, symbol, timeframe, open_time_ms);
+
+                CREATE TABLE IF NOT EXISTS derivatives_observations (
+                    market TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    period TEXT NOT NULL DEFAULT '',
+                    event_time_ms INTEGER NOT NULL,
+                    fetched_at_ms INTEGER NOT NULL,
+                    available_at_ms INTEGER NOT NULL DEFAULT 0,
+                    data_kind TEXT NOT NULL CHECK(data_kind IN ('historical', 'snapshot')),
+                    value_json TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    source_endpoint TEXT NOT NULL,
+                    quality TEXT NOT NULL DEFAULT 'ok',
+                    PRIMARY KEY (
+                        market, exchange, symbol, metric, period, event_time_ms, data_kind
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_derivatives_instrument_time
+                    ON derivatives_observations(
+                        market, exchange, symbol, event_time_ms, metric
+                    );
+                CREATE INDEX IF NOT EXISTS idx_derivatives_kind_time
+                    ON derivatives_observations(data_kind, event_time_ms);
+
+                CREATE TABLE IF NOT EXISTS derivatives_collection_runs (
+                    run_id TEXT PRIMARY KEY,
+                    market TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    start_time_ms INTEGER NOT NULL,
+                    end_time_ms INTEGER NOT NULL,
+                    fetched_at_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_derivatives_runs_instrument
+                    ON derivatives_collection_runs(
+                        market, exchange, symbol, period, fetched_at_ms DESC
+                    );
                 """
             )
+            derivative_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(derivatives_observations)").fetchall()
+            }
+            if "available_at_ms" not in derivative_columns:
+                db.execute(
+                    "ALTER TABLE derivatives_observations "
+                    "ADD COLUMN available_at_ms INTEGER NOT NULL DEFAULT 0"
+                )
+                # Old historical imports did not retain publication/availability
+                # semantics. Keep them unavailable to strict replay rather than
+                # guessing when they first became usable. Old snapshots used the
+                # fetch timestamp as their event timestamp and can be retained.
+                db.execute(
+                    "UPDATE derivatives_observations "
+                    "SET available_at_ms=CASE "
+                    "WHEN data_kind='snapshot' THEN fetched_at_ms ELSE 0 END"
+                )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_derivatives_available_time "
+                "ON derivatives_observations(market, exchange, symbol, available_at_ms)"
+            )
+
             # A process-local job cannot survive a backend restart. Mark any
             # unfinished persisted record as interrupted instead of leaving it queued forever.
             db.execute(
@@ -343,6 +434,539 @@ class AnalysisHistoryStore:
             )
         return cursor.rowcount > 0
 
+    def upsert_derivatives_observations(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> int:
+        if not observations:
+            return 0
+        rows = []
+        for item in observations:
+            data_kind = str(item.get("data_kind", "historical"))
+            if data_kind not in {"historical", "snapshot"}:
+                raise ValueError("data_kind must be historical or snapshot")
+            rows.append(
+                (
+                    str(item["market"]),
+                    str(item["exchange"]),
+                    str(item["symbol"]).upper(),
+                    str(item["metric"]),
+                    str(item.get("period") or ""),
+                    int(item["event_time_ms"]),
+                    int(item["fetched_at_ms"]),
+                    int(item.get("available_at_ms", 0)),
+                    data_kind,
+                    self._json(item.get("value", {})),
+                    self._json(item.get("raw", {})),
+                    str(item["source_endpoint"]),
+                    str(item.get("quality") or "ok"),
+                )
+            )
+        with self._lock, self._session() as db:
+            db.executemany(
+                """
+                INSERT INTO derivatives_observations (
+                    market, exchange, symbol, metric, period, event_time_ms,
+                    fetched_at_ms, available_at_ms, data_kind, value_json, raw_json,
+                    source_endpoint, quality
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    market, exchange, symbol, metric, period, event_time_ms, data_kind
+                ) DO UPDATE SET
+                    fetched_at_ms=excluded.fetched_at_ms,
+                    available_at_ms=excluded.available_at_ms,
+                    value_json=excluded.value_json,
+                    raw_json=excluded.raw_json,
+                    source_endpoint=excluded.source_endpoint,
+                    quality=excluded.quality
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def save_derivatives_collection_run(self, run: dict[str, Any]) -> None:
+        with self._lock, self._session() as db:
+            db.execute(
+                """
+                INSERT INTO derivatives_collection_runs (
+                    run_id, market, exchange, symbol, period, start_time_ms,
+                    end_time_ms, fetched_at_ms, status, metrics_json, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status=excluded.status,
+                    fetched_at_ms=excluded.fetched_at_ms,
+                    metrics_json=excluded.metrics_json,
+                    note=excluded.note
+                """,
+                (
+                    str(run["run_id"]),
+                    str(run["market"]),
+                    str(run["exchange"]),
+                    str(run["symbol"]).upper(),
+                    str(run.get("period") or ""),
+                    int(run["start_time_ms"]),
+                    int(run["end_time_ms"]),
+                    int(run["fetched_at_ms"]),
+                    str(run["status"]),
+                    self._json(run.get("metrics", {})),
+                    str(run.get("note") or ""),
+                ),
+            )
+
+    def list_derivatives_observations(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        metric: str | None = None,
+        period: str | None = None,
+        data_kind: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        clauses = ["market=?", "exchange=?", "symbol=?"]
+        params: list[Any] = [market, exchange, symbol.upper()]
+        for column, value in (
+            ("event_time_ms", None),
+            ("metric", metric),
+            ("period", period),
+            ("data_kind", data_kind),
+        ):
+            if column == "event_time_ms":
+                if start_ms is not None:
+                    clauses.append("event_time_ms>=?")
+                    params.append(int(start_ms))
+                if end_ms is not None:
+                    clauses.append("event_time_ms<=?")
+                    params.append(int(end_ms))
+            elif value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        params.append(min(max(int(limit), 1), 50000))
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT * FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                ORDER BY event_time_ms ASC, metric ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "market": row["market"],
+                "exchange": row["exchange"],
+                "symbol": row["symbol"],
+                "metric": row["metric"],
+                "period": row["period"],
+                "event_time_ms": row["event_time_ms"],
+                "fetched_at_ms": row["fetched_at_ms"],
+                "available_at_ms": row["available_at_ms"],
+                "data_kind": row["data_kind"],
+                "value": self._decode(row["value_json"], {}),
+                "raw": self._decode(row["raw_json"], {}),
+                "source_endpoint": row["source_endpoint"],
+                "quality": row["quality"],
+            }
+            for row in rows
+        ]
+
+    def list_derivatives_observations_asof(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        decision_time_ms: int,
+        period: str | None = None,
+        include_snapshots: bool = True,
+        limit: int = 10000,
+    ) -> dict[str, Any]:
+        """Return only observations both occurring and available by the decision cutoff.
+
+        Historical records use exchange-specific publication availability times.
+        Snapshots are usable only when their actual fetch time is no later than
+        the historical decision time. Legacy historical rows with unknown
+        availability (available_at_ms=0) are deliberately excluded.
+        """
+        clauses = [
+            "market=?",
+            "exchange=?",
+            "symbol=?",
+            "event_time_ms<=?",
+            "available_at_ms>0",
+            "available_at_ms<=?",
+        ]
+        params: list[Any] = [
+            market,
+            exchange,
+            symbol.upper(),
+            int(decision_time_ms),
+            int(decision_time_ms),
+        ]
+        if period is not None:
+            clauses.append("(period=? OR metric='funding_rate')")
+            params.append(period)
+        if not include_snapshots:
+            clauses.append("data_kind='historical'")
+        bounded_limit = min(max(int(limit), 1), 50000)
+        with self._session() as db:
+            eligible_total = db.execute(
+                f"""
+                SELECT COUNT(*) FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                """,
+                params,
+            ).fetchone()[0]
+            rows = db.execute(
+                f"""
+                SELECT * FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                ORDER BY available_at_ms DESC, event_time_ms DESC
+                LIMIT ?
+                """,
+                [*params, bounded_limit],
+            ).fetchall()
+            total_rows = db.execute(
+                """
+                SELECT COUNT(*) FROM derivatives_observations
+                WHERE market=? AND exchange=? AND symbol=?
+                """,
+                (market, exchange, symbol.upper()),
+            ).fetchone()[0]
+        rows = list(reversed(rows))
+        items = [
+            {
+                "market": row["market"],
+                "exchange": row["exchange"],
+                "symbol": row["symbol"],
+                "metric": row["metric"],
+                "period": row["period"],
+                "event_time_ms": row["event_time_ms"],
+                "fetched_at_ms": row["fetched_at_ms"],
+                "available_at_ms": row["available_at_ms"],
+                "data_kind": row["data_kind"],
+                "value": self._decode(row["value_json"], {}),
+                "raw": self._decode(row["raw_json"], {}),
+                "source_endpoint": row["source_endpoint"],
+                "quality": row["quality"],
+            }
+            for row in rows
+        ]
+        return {
+            "items": items,
+            "eligible_count": int(eligible_total),
+            "returned_count": len(items),
+            "truncated": int(eligible_total) > len(items),
+            "excluded_or_unavailable_count": max(0, int(total_rows) - int(eligible_total)),
+            "latest_available_at_ms": max(
+                (item["available_at_ms"] for item in items),
+                default=None,
+            ),
+        }
+
+    def derivatives_archive_stats(
+        self,
+        *,
+        market: str | None = None,
+        exchange: str | None = None,
+        symbol: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        for column, value in (
+            ("market", market),
+            ("exchange", exchange),
+            ("symbol", symbol.upper() if symbol else None),
+        ):
+            if value:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT market, exchange, symbol, metric, period, data_kind,
+                       COUNT(*) AS record_count,
+                       MIN(event_time_ms) AS oldest_event_time_ms,
+                       MAX(event_time_ms) AS newest_event_time_ms,
+                       MAX(fetched_at_ms) AS last_fetched_at_ms
+                FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                GROUP BY market, exchange, symbol, metric, period, data_kind
+                ORDER BY exchange, symbol, metric, period, data_kind
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_derivatives_collection_runs(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._session() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM derivatives_collection_runs
+                WHERE market=? AND exchange=? AND symbol=?
+                ORDER BY fetched_at_ms DESC LIMIT ?
+                """,
+                (market, exchange, symbol.upper(), min(max(int(limit), 1), 100)),
+            ).fetchall()
+        return [
+            {
+                "run_id": row["run_id"],
+                "period": row["period"],
+                "start_time_ms": row["start_time_ms"],
+                "end_time_ms": row["end_time_ms"],
+                "fetched_at_ms": row["fetched_at_ms"],
+                "status": row["status"],
+                "metrics": self._decode(row["metrics_json"], {}),
+                "note": row["note"],
+            }
+            for row in rows
+        ]
+
+    def save_derivatives_snapshot(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        context: dict[str, Any],
+        source_endpoint: str,
+    ) -> int:
+        fetched_at_ms = int(time.time() * 1000)
+        quality = context.get("data_quality") or {}
+        excluded = {
+            "symbol", "exchange", "data_timestamp", "data_quality",
+            "stats_history", "funding_rate_history",
+        }
+        observations = []
+        for metric, value in context.items():
+            if metric in excluded or value is None:
+                continue
+            observations.append(
+                {
+                    "market": market,
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "metric": metric,
+                    "period": str(context.get("stats_interval") or ""),
+                    "event_time_ms": int(context.get("data_timestamp") or fetched_at_ms),
+                    "fetched_at_ms": fetched_at_ms,
+                    "available_at_ms": fetched_at_ms,
+                    "data_kind": "snapshot",
+                    "value": {"value": value},
+                    "raw": context,
+                    "source_endpoint": source_endpoint,
+                    "quality": str(quality.get(metric, "snapshot")),
+                }
+            )
+        return self.upsert_derivatives_observations(observations)
+
+    def upsert_market_candles(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        candles: list[Any],
+    ) -> int:
+        """Persist completed OHLCV candles with source/instrument identity."""
+        def value(candle: Any, key: str, default: Any = None) -> Any:
+            if isinstance(candle, dict):
+                return candle.get(key, default)
+            return getattr(candle, key, default)
+
+        rows = []
+        for candle in candles:
+            if not bool(value(candle, "closed", False)):
+                continue
+            rows.append(
+                (
+                    market,
+                    exchange,
+                    symbol.upper(),
+                    timeframe,
+                    int(value(candle, "open_time")),
+                    int(value(candle, "close_time")),
+                    str(value(candle, "open")),
+                    str(value(candle, "high")),
+                    str(value(candle, "low")),
+                    str(value(candle, "close")),
+                    str(value(candle, "volume")),
+                    str(value(candle, "quote_volume", "") or ""),
+                    value(candle, "trades"),
+                    str(value(candle, "taker_buy_base_volume", "") or ""),
+                    str(value(candle, "taker_buy_quote_volume", "") or ""),
+                    str(value(candle, "volume_unit", "base_asset") or "base_asset"),
+                    (
+                        str(value(candle, "contract_volume"))
+                        if value(candle, "contract_volume") is not None
+                        else None
+                    ),
+                    _now(),
+                )
+            )
+        if not rows:
+            return 0
+
+        with self._lock, self._session() as db:
+            db.executemany(
+                """
+                INSERT INTO market_candles (
+                    market, exchange, symbol, timeframe, open_time_ms, close_time_ms,
+                    open, high, low, close, volume, quote_volume, trades,
+                    taker_buy_base_volume, taker_buy_quote_volume, volume_unit,
+                    contract_volume, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(market, exchange, symbol, timeframe, open_time_ms)
+                DO UPDATE SET
+                    close_time_ms=excluded.close_time_ms,
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    volume=excluded.volume,
+                    quote_volume=excluded.quote_volume,
+                    trades=excluded.trades,
+                    taker_buy_base_volume=excluded.taker_buy_base_volume,
+                    taker_buy_quote_volume=excluded.taker_buy_quote_volume,
+                    volume_unit=excluded.volume_unit,
+                    contract_volume=excluded.contract_volume,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def market_candle_coverage(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+    ) -> dict[str, int | None]:
+        with self._session() as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS candle_count,
+                       MIN(open_time_ms) AS oldest_open_time_ms,
+                       MAX(open_time_ms) AS newest_open_time_ms
+                FROM market_candles
+                WHERE market=? AND exchange=? AND symbol=? AND timeframe=?
+                """,
+                (market, exchange, symbol.upper(), timeframe),
+            ).fetchone()
+        return {
+            "candle_count": int(row["candle_count"]),
+            "oldest_open_time_ms": row["oldest_open_time_ms"],
+            "newest_open_time_ms": row["newest_open_time_ms"],
+        }
+
+    def list_market_candles(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 30000,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "market=?",
+            "exchange=?",
+            "symbol=?",
+            "timeframe=?",
+        ]
+        params: list[Any] = [market, exchange, symbol.upper(), timeframe]
+        if start_ms is not None:
+            clauses.append("open_time_ms>=?")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("open_time_ms<=?")
+            params.append(int(end_ms))
+        params.append(min(max(int(limit), 1), 50000))
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT * FROM market_candles
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY open_time_ms DESC
+                    LIMIT ?
+                ) ORDER BY open_time_ms ASC
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "open_time": row["open_time_ms"],
+                "close_time": row["close_time_ms"],
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+                "quote_volume": row["quote_volume"],
+                "trades": row["trades"],
+                "taker_buy_base_volume": row["taker_buy_base_volume"],
+                "taker_buy_quote_volume": row["taker_buy_quote_volume"],
+                "closed": True,
+                "exchange": row["exchange"],
+                "market_type": row["market"],
+                "volume_unit": row["volume_unit"],
+                "contract_volume": row["contract_volume"],
+            }
+            for row in rows
+        ]
+
+    def market_candle_stats(
+        self,
+        *,
+        market: str | None = None,
+        exchange: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        for column, value in (
+            ("market", market),
+            ("exchange", exchange),
+            ("symbol", symbol.upper() if symbol else None),
+            ("timeframe", timeframe),
+        ):
+            if value:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT market, exchange, symbol, timeframe,
+                       COUNT(*) AS candle_count,
+                       MIN(open_time_ms) AS oldest_open_time_ms,
+                       MAX(open_time_ms) AS newest_open_time_ms
+                FROM market_candles
+                WHERE {' AND '.join(clauses)}
+                GROUP BY market, exchange, symbol, timeframe
+                ORDER BY exchange, market, symbol, timeframe
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def upsert_segments(self, samples: list[dict[str, Any]]) -> int:
         if not samples:
             return 0
@@ -476,7 +1100,11 @@ class AnalysisHistoryStore:
                 """,
                 (market, exchange, symbol.upper(), timeframe, int(before_ms)),
             ).fetchall()
-        candidates = [self._segment_row(row) for row in rows]
+        candidates = [
+            item
+            for item in (self._segment_row(row) for row in rows)
+            if 0 < int((item.get("labels") or {}).get("future_end_ms", 0)) <= int(before_ms)
+        ]
         for item in candidates:
             item["similarity"] = similarity_score(
                 {"regime": features.get("regime"), "features": features.get("features", {})},

@@ -4,17 +4,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from app.adapters.binance.models import MarketType
+from app.adapters.binance.models import KlineDTO, MarketType
 from app.adapters.binance.normalizer import to_core_bars
 from app.core.config import Settings as WebSettings
 from app.services.crypto_context import CryptoMarketContext, render_crypto_context
 from app.services.crypto_prompt_assembler import CryptoPromptAssembler
 from app.services.analysis_trace import AnalysisTrace, TracingClient, TracingValidator
 from app.services.segmenter import build_current_features, build_segment_samples
+from app.services.historical_replay import (
+    build_historical_derivatives_context,
+    context_period,
+)
 
 logger = logging.getLogger("pa_crypto.analysis")
 
@@ -157,6 +161,14 @@ class AnalysisService:
         historical_similarity: list[dict[str, Any]] = []
         if self._history_store is not None:
             try:
+                await asyncio.to_thread(
+                    self._history_store.upsert_market_candles,
+                    market=market,
+                    exchange=exchange,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    candles=rows,
+                )
                 samples = build_segment_samples(
                     rows,
                     market=market,
@@ -244,6 +256,18 @@ class AnalysisService:
                 market_type=market,
                 **derivatives.model_dump(),
             )
+            if self._history_store is not None:
+                try:
+                    await asyncio.to_thread(
+                        self._history_store.save_derivatives_snapshot,
+                        market=market,
+                        exchange=exchange,
+                        symbol=symbol,
+                        context=derivatives.model_dump(),
+                        source_endpoint=f"/api/v1/market/usdm/{symbol}/context",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to persist derivatives context snapshot")
             trace.emit(
                 "derivatives_context_loaded",
                 stage="market",
@@ -304,6 +328,229 @@ class AnalysisService:
             }
             for item in historical_similarity
         ]
+        return run
+
+    async def analyze_historical(
+        self,
+        market: MarketType,
+        symbol: str,
+        timeframe: str,
+        analysis_bars: int,
+        exchange: str,
+        decision_time_ms: int,
+        on_trace: Any | None = None,
+    ) -> AnalysisRun:
+        """Run the original PA orchestrator against an immutable as-of archive snapshot.
+
+        This path deliberately never calls live exchange APIs and never loads
+        future labels. Kline availability is determined by candle close time;
+        derivatives are filtered by both event_time and available_at.
+        """
+        if self._history_store is None:
+            raise AnalysisConfigurationError("历史行情归档未配置，无法执行历史回放")
+        if analysis_bars < 20 or analysis_bars + 50 > self._web_settings.max_klines:
+            raise ValueError("analysis_bars must be between 20 and server max bars minus 50")
+        if decision_time_ms <= 0:
+            raise ValueError("decision_time_ms must be a positive Unix millisecond timestamp")
+        if market == "usdm" and exchange not in {"binance", "gate"}:
+            raise ValueError("Historical USD-M replay is supported only for Binance and Gate")
+        if market == "spot" and exchange == "gate":
+            raise ValueError("Gate spot replay is not supported")
+
+        interval_ms = {
+            "1m": 60_000, "3m": 180_000, "5m": 300_000,
+            "15m": 900_000, "30m": 1_800_000,
+            "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+            "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+            "1d": 86_400_000, "3d": 259_200_000, "1w": 604_800_000,
+            "7d": 604_800_000,
+        }.get(timeframe)
+        if interval_ms is None:
+            raise ValueError(f"Historical replay does not support timeframe {timeframe}")
+
+        provider_config = self._active_provider()
+        trace = AnalysisTrace(on_trace)
+        trace.emit(
+            "historical_replay_started",
+            stage="system",
+            title="历史回放分析已启动",
+            detail=f"{symbol} · {timeframe} · {exchange} · 截止 {decision_time_ms}",
+            data={
+                "market": market,
+                "exchange": exchange,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "analysis_bars": analysis_bars,
+                "decision_time_ms": decision_time_ms,
+            },
+        )
+
+        required_bars = analysis_bars + 50
+        archived_rows = await asyncio.to_thread(
+            self._history_store.list_market_candles,
+            market=market,
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            end_ms=decision_time_ms - 1,
+            limit=min(required_bars + 20, 50000),
+        )
+        closed_rows = [
+            item
+            for item in archived_rows
+            if int(item.get("close_time", 0)) < decision_time_ms
+        ]
+        if len(closed_rows) < required_bars:
+            raise InsufficientMarketDataError(
+                f"历史时点 {decision_time_ms} 之前只有 {len(closed_rows)} 根已收盘归档 K 线，"
+                f"至少需要 {required_bars} 根；请先补齐历史行情。"
+            )
+        selected_rows = closed_rows[-required_bars:]
+        for left, right in zip(selected_rows, selected_rows[1:]):
+            if int(right["open_time"]) - int(left["open_time"]) != interval_ms:
+                raise InsufficientMarketDataError(
+                    "历史 K 线归档存在时间缺口，当前回放要求分析窗口连续；"
+                    "请先补齐缺失区间或选择其他回放时点。"
+                )
+
+        candles = [
+            KlineDTO(
+                open_time=int(item["open_time"]),
+                close_time=int(item["close_time"]),
+                open=str(item["open"]),
+                high=str(item["high"]),
+                low=str(item["low"]),
+                close=str(item["close"]),
+                volume=str(item["volume"]),
+                quote_volume=str(item.get("quote_volume") or ""),
+                trades=item.get("trades"),
+                taker_buy_base_volume=str(item.get("taker_buy_base_volume") or ""),
+                taker_buy_quote_volume=str(item.get("taker_buy_quote_volume") or ""),
+                closed=True,
+                exchange=exchange,
+                market_type=market,
+                volume_unit=str(item.get("volume_unit") or "base_asset"),
+                contract_volume=item.get("contract_volume"),
+            )
+            for item in selected_rows
+        ]
+        core_bars = to_core_bars(candles)
+        from pa_agent.data.snapshot import build_analysis_frame
+
+        frame = build_analysis_frame(
+            core_bars,
+            analysis_bars,
+            symbol,
+            timeframe,
+            now_ms=decision_time_ms,
+        )
+        if frame is None:
+            raise InsufficientMarketDataError("归档 K 线不足以构建历史 PA 分析帧")
+        frame = replace(frame, snapshot_ts_local_ms=decision_time_ms)
+
+        derivative_provenance: dict[str, Any] = {
+            "observation_count": 0,
+            "historical_count": 0,
+            "snapshot_count": 0,
+            "metrics_used": [],
+            "missing_metrics": [],
+            "future_observations_excluded": True,
+        }
+        if market == "usdm":
+            period = context_period(exchange, timeframe)
+            asof = await asyncio.to_thread(
+                self._history_store.list_derivatives_observations_asof,
+                market="usdm",
+                exchange=exchange,
+                symbol=symbol,
+                decision_time_ms=decision_time_ms,
+                period=period,
+                include_snapshots=True,
+            )
+            context, derivative_provenance = build_historical_derivatives_context(
+                asof["items"],
+                exchange=exchange,
+                symbol=symbol,
+                period=period,
+                decision_time_ms=decision_time_ms,
+            )
+            derivative_provenance["eligible_observation_count"] = asof["eligible_count"]
+            derivative_provenance["returned_observation_count"] = asof["returned_count"]
+            derivative_provenance["observation_query_truncated"] = asof["truncated"]
+            derivative_provenance["excluded_or_unavailable_count"] = asof[
+                "excluded_or_unavailable_count"
+            ]
+            derivative_provenance["latest_available_at_ms"] = asof[
+                "latest_available_at_ms"
+            ]
+            trace.emit(
+                "historical_derivatives_reconstructed",
+                stage="market",
+                title="历史衍生品上下文已按可用时间重建",
+                detail=(
+                    f"可用观测 {asof['eligible_count']} 条；"
+                    f"使用指标 {len(derivative_provenance['metrics_used'])} 项"
+                ),
+                data=derivative_provenance,
+            )
+        else:
+            context = CryptoMarketContext(
+                market_type=f"spot:{exchange}",
+                exchange=exchange,
+                symbol=symbol,
+                data_timestamp=decision_time_ms,
+                data_quality={
+                    "derivatives": "not_available_for_spot_replay",
+                    "historical_replay": "asof_candles_only",
+                },
+            )
+
+        trace.emit(
+            "historical_frame_ready",
+            stage="market",
+            title="历史 K 线分析帧已构建",
+            detail=(
+                f"{len(selected_rows)} 根连续已收盘 K 线；"
+                f"最新收盘时间 {selected_rows[-1]['close_time']}"
+            ),
+            data={
+                "first_open_time_ms": selected_rows[0]["open_time"],
+                "latest_open_time_ms": selected_rows[-1]["open_time"],
+                "latest_close_time_ms": selected_rows[-1]["close_time"],
+                "decision_time_ms": decision_time_ms,
+                "future_candles_included": False,
+            },
+        )
+
+        run = await asyncio.to_thread(
+            self._run_sync, frame, context, provider_config, trace
+        )
+        run.details["provenance"] = {
+            "analysis_mode": "historical_replay",
+            "decision_time_ms": decision_time_ms,
+            "candle_source": "sqlite:market_candles",
+            "candle_count": len(selected_rows),
+            "first_candle_open_time_ms": selected_rows[0]["open_time"],
+            "latest_candle_open_time_ms": selected_rows[-1]["open_time"],
+            "latest_candle_close_time_ms": selected_rows[-1]["close_time"],
+            "derivatives": derivative_provenance,
+            "live_exchange_requests": False,
+            "future_candles_excluded": True,
+            "future_labels_excluded": True,
+            "experience_learning_disabled": True,
+        }
+        trace.emit(
+            "historical_replay_completed",
+            stage="system",
+            title="历史回放分析完成",
+            detail="已使用当前 PA 两阶段流程完成指定历史时点分析；未执行任何交易操作",
+            data={
+                "decision_time_ms": decision_time_ms,
+                "analysis_status": "failed" if run.record.exception else "completed",
+                "model_usage": run.record.usage_total,
+            },
+        )
+        run.trace = trace.snapshot()
         return run
 
     def _run_sync(

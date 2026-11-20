@@ -93,3 +93,24 @@ def test_baseline_never_fabricates_accuracy_when_samples_insufficient():
     report = evaluate_rule_baseline(samples)
     assert report["status"] == "insufficient_data"
     assert "rule_baseline" not in report
+
+
+
+def test_gate_backfill_resume_stops_before_oldest_archived_open_time(monkeypatch):
+    monkeypatch.setattr("app.services.historical_backfill.time.time", lambda: 6_000_035)
+    gate = FakeGate()
+    oldest_archived_open_ms = 120 * 60_000
+
+    result = asyncio.run(
+        backfill_gate_candles(
+            gate,
+            symbol="BTCUSDT",
+            timeframe="1m",
+            requested_bars=80,
+            end_ms=oldest_archived_open_ms + 1,
+        )
+    )
+
+    assert result["closed_bars"] == 80
+    assert result["bars"][-1].open_time < oldest_archived_open_ms
+    assert gate.requests[0]["to"] == 119 * 60

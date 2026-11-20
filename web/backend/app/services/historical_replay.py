@@ -30,6 +30,52 @@ def context_period(exchange: str, timeframe: str) -> str:
     return _BINANCE_CONTEXT_PERIODS.get(timeframe, "1d")
 
 
+def select_replay_decision_times(
+    archived_rows: list[dict[str, Any]],
+    *,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    required_bars: int,
+    points: int,
+) -> tuple[list[int], int]:
+    """Select evenly spaced closed-candle boundaries with a full contiguous warmup."""
+    interval_ms = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000,
+        "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+        "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+        "1d": 86_400_000, "3d": 259_200_000,
+        "1w": 604_800_000, "7d": 604_800_000,
+    }.get(timeframe)
+    if interval_ms is None:
+        raise ValueError(f"Historical replay does not support timeframe {timeframe}")
+    if required_bars < 1 or points < 1:
+        raise ValueError("required_bars and points must be positive")
+    rows = sorted(archived_rows, key=lambda item: int(item["open_time"]))
+    candidates: list[int] = []
+    for index in range(required_bars - 1, len(rows)):
+        decision_time = int(rows[index]["close_time"]) + 1
+        if decision_time < start_ms or decision_time > end_ms:
+            continue
+        window = rows[index - required_bars + 1 : index + 1]
+        if all(
+            int(right["open_time"]) - int(left["open_time"]) == interval_ms
+            for left, right in zip(window, window[1:])
+        ):
+            candidates.append(decision_time)
+    if not candidates:
+        return [], 0
+    count = min(points, len(candidates))
+    if count == 1:
+        return [candidates[-1]], len(candidates)
+    indices = [
+        round(index * (len(candidates) - 1) / (count - 1))
+        for index in range(count)
+    ]
+    return list(dict.fromkeys(candidates[index] for index in indices)), len(candidates)
+
+
 def _number(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
@@ -208,7 +254,13 @@ def build_historical_derivatives_context(
         market_type="usdm",
         exchange=exchange,
         symbol=symbol,
-        contract=f"{symbol[:-4]}_USDT" if exchange == "gate" and symbol.endswith("USDT") else symbol,
+        contract=(
+            symbol.upper()
+            if exchange == "gate" and "_" in symbol
+            else f"{symbol[:-4]}_USDT"
+            if exchange == "gate" and symbol.endswith("USDT")
+            else symbol
+        ),
         data_timestamp=max(event_times, default=decision_time_ms),
         mark_price=_text(mark_price),
         funding_rate=_text(funding_value),

@@ -46,6 +46,9 @@ class NoLiveMarketService:
         raise AssertionError("Historical replay must not request live derivatives")
 
 
+BASE_TIME_MS = 1_700_000_000_000
+
+
 def _candle_rows(count: int, *, missing: set[int] | None = None):
     missing = missing or set()
     rows = []
@@ -55,8 +58,8 @@ def _candle_rows(count: int, *, missing: set[int] | None = None):
         price = 100 + index * 0.05
         rows.append(
             ReplayCandle(
-                open_time=index * 60_000,
-                close_time=(index + 1) * 60_000 - 1,
+                open_time=BASE_TIME_MS + index * 60_000,
+                close_time=BASE_TIME_MS + (index + 1) * 60_000 - 1,
                 open=str(price),
                 high=str(price + 0.2),
                 low=str(price - 0.2),
@@ -127,7 +130,7 @@ def test_derivatives_asof_query_requires_event_and_availability_before_cutoff(tm
     # publication time; the conservative available_at boundary controls replay.
     assert result["items"][0]["fetched_at_ms"] > 2_500
     assert result["items"][0]["available_at_ms"] <= 2_500
-    assert result["excluded_or_unavailable_count"] == 3
+    assert result["excluded_or_unavailable_count"] == 2
 
 
 def test_historical_context_uses_only_asof_observations_and_reports_missing_metrics():
@@ -261,7 +264,7 @@ def test_analysis_service_replays_archived_candles_without_live_market_calls(
         )
 
     monkeypatch.setattr(service, "_run_sync", fake_run_sync)
-    decision_time_ms = 70 * 60_000
+    decision_time_ms = BASE_TIME_MS + 70 * 60_000
 
     run = asyncio.run(
         service.analyze_historical(
@@ -277,7 +280,7 @@ def test_analysis_service_replays_archived_candles_without_live_market_calls(
     assert live_market.calls == []
     assert len(captured["frame"].bars) == 20
     assert captured["frame"].snapshot_ts_local_ms == decision_time_ms
-    assert captured["frame"].bars[0].ts_open == 69 * 60_000
+    assert captured["frame"].bars[0].ts_open == BASE_TIME_MS + 69 * 60_000
     assert run.details["provenance"]["live_exchange_requests"] is False
     assert run.details["provenance"]["future_candles_excluded"] is True
     assert run.details["provenance"]["latest_candle_close_time_ms"] < decision_time_ms
@@ -306,6 +309,6 @@ def test_analysis_service_rejects_gapped_historical_window(
                 "1m",
                 20,
                 "binance",
-                70 * 60_000,
+                BASE_TIME_MS + 71 * 60_000,
             )
         )

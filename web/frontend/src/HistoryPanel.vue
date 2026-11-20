@@ -184,6 +184,15 @@ async function openAnalysis(item: AnalysisHistoryItem) {
   }
 }
 
+async function openReplayAnalysis(analysisId: string) {
+  error.value = "";
+  try {
+    selectedAnalysis.value = await api.getAnalysisHistory(analysisId);
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "读取回放分析详情失败";
+  }
+}
+
 function showAnalysisOnChart() {
   if (selectedAnalysis.value) {
     emit("select-analysis", selectedAnalysis.value);
@@ -841,6 +850,11 @@ onMounted(() => {
                 </p>
                 <p v-else>{{ item.error }}</p>
                 <small v-if="item.usage">Token：{{ item.usage.total_tokens ?? "--" }}</small>
+                <button
+                  v-if="item.analysis_id"
+                  class="text-action"
+                  @click="openReplayAnalysis(item.analysis_id)"
+                >查看完整分析详情</button>
               </article>
             </div>
           </section>

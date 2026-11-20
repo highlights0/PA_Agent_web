@@ -134,6 +134,48 @@ class AnalysisHistoryStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_market_candles_instrument_time
                     ON market_candles(market, exchange, symbol, timeframe, open_time_ms);
+
+                CREATE TABLE IF NOT EXISTS derivatives_observations (
+                    market TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    metric TEXT NOT NULL,
+                    period TEXT NOT NULL DEFAULT '',
+                    event_time_ms INTEGER NOT NULL,
+                    fetched_at_ms INTEGER NOT NULL,
+                    data_kind TEXT NOT NULL CHECK(data_kind IN ('historical', 'snapshot')),
+                    value_json TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    source_endpoint TEXT NOT NULL,
+                    quality TEXT NOT NULL DEFAULT 'ok',
+                    PRIMARY KEY (
+                        market, exchange, symbol, metric, period, event_time_ms, data_kind
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_derivatives_instrument_time
+                    ON derivatives_observations(
+                        market, exchange, symbol, event_time_ms, metric
+                    );
+                CREATE INDEX IF NOT EXISTS idx_derivatives_kind_time
+                    ON derivatives_observations(data_kind, event_time_ms);
+
+                CREATE TABLE IF NOT EXISTS derivatives_collection_runs (
+                    run_id TEXT PRIMARY KEY,
+                    market TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    start_time_ms INTEGER NOT NULL,
+                    end_time_ms INTEGER NOT NULL,
+                    fetched_at_ms INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    metrics_json TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_derivatives_runs_instrument
+                    ON derivatives_collection_runs(
+                        market, exchange, symbol, period, fetched_at_ms DESC
+                    );
                 """
             )
             # A process-local job cannot survive a backend restart. Mark any
@@ -366,6 +408,247 @@ class AnalysisHistoryStore:
                 (search_id, owner_key(owner)),
             )
         return cursor.rowcount > 0
+
+    def upsert_derivatives_observations(
+        self,
+        observations: list[dict[str, Any]],
+    ) -> int:
+        if not observations:
+            return 0
+        rows = []
+        for item in observations:
+            data_kind = str(item.get("data_kind", "historical"))
+            if data_kind not in {"historical", "snapshot"}:
+                raise ValueError("data_kind must be historical or snapshot")
+            rows.append(
+                (
+                    str(item["market"]),
+                    str(item["exchange"]),
+                    str(item["symbol"]).upper(),
+                    str(item["metric"]),
+                    str(item.get("period") or ""),
+                    int(item["event_time_ms"]),
+                    int(item["fetched_at_ms"]),
+                    data_kind,
+                    self._json(item.get("value", {})),
+                    self._json(item.get("raw", {})),
+                    str(item["source_endpoint"]),
+                    str(item.get("quality") or "ok"),
+                )
+            )
+        with self._lock, self._session() as db:
+            db.executemany(
+                """
+                INSERT INTO derivatives_observations (
+                    market, exchange, symbol, metric, period, event_time_ms,
+                    fetched_at_ms, data_kind, value_json, raw_json,
+                    source_endpoint, quality
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(
+                    market, exchange, symbol, metric, period, event_time_ms, data_kind
+                ) DO UPDATE SET
+                    fetched_at_ms=excluded.fetched_at_ms,
+                    value_json=excluded.value_json,
+                    raw_json=excluded.raw_json,
+                    source_endpoint=excluded.source_endpoint,
+                    quality=excluded.quality
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def save_derivatives_collection_run(self, run: dict[str, Any]) -> None:
+        with self._lock, self._session() as db:
+            db.execute(
+                """
+                INSERT INTO derivatives_collection_runs (
+                    run_id, market, exchange, symbol, period, start_time_ms,
+                    end_time_ms, fetched_at_ms, status, metrics_json, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status=excluded.status,
+                    fetched_at_ms=excluded.fetched_at_ms,
+                    metrics_json=excluded.metrics_json,
+                    note=excluded.note
+                """,
+                (
+                    str(run["run_id"]),
+                    str(run["market"]),
+                    str(run["exchange"]),
+                    str(run["symbol"]).upper(),
+                    str(run.get("period") or ""),
+                    int(run["start_time_ms"]),
+                    int(run["end_time_ms"]),
+                    int(run["fetched_at_ms"]),
+                    str(run["status"]),
+                    self._json(run.get("metrics", {})),
+                    str(run.get("note") or ""),
+                ),
+            )
+
+    def list_derivatives_observations(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        metric: str | None = None,
+        period: str | None = None,
+        data_kind: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        clauses = ["market=?", "exchange=?", "symbol=?"]
+        params: list[Any] = [market, exchange, symbol.upper()]
+        for column, value in (
+            ("event_time_ms", None),
+            ("metric", metric),
+            ("period", period),
+            ("data_kind", data_kind),
+        ):
+            if column == "event_time_ms":
+                if start_ms is not None:
+                    clauses.append("event_time_ms>=?")
+                    params.append(int(start_ms))
+                if end_ms is not None:
+                    clauses.append("event_time_ms<=?")
+                    params.append(int(end_ms))
+            elif value is not None:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        params.append(min(max(int(limit), 1), 50000))
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT * FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                ORDER BY event_time_ms ASC, metric ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "market": row["market"],
+                "exchange": row["exchange"],
+                "symbol": row["symbol"],
+                "metric": row["metric"],
+                "period": row["period"],
+                "event_time_ms": row["event_time_ms"],
+                "fetched_at_ms": row["fetched_at_ms"],
+                "data_kind": row["data_kind"],
+                "value": self._decode(row["value_json"], {}),
+                "raw": self._decode(row["raw_json"], {}),
+                "source_endpoint": row["source_endpoint"],
+                "quality": row["quality"],
+            }
+            for row in rows
+        ]
+
+    def derivatives_archive_stats(
+        self,
+        *,
+        market: str | None = None,
+        exchange: str | None = None,
+        symbol: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        for column, value in (
+            ("market", market),
+            ("exchange", exchange),
+            ("symbol", symbol.upper() if symbol else None),
+        ):
+            if value:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT market, exchange, symbol, metric, period, data_kind,
+                       COUNT(*) AS record_count,
+                       MIN(event_time_ms) AS oldest_event_time_ms,
+                       MAX(event_time_ms) AS newest_event_time_ms,
+                       MAX(fetched_at_ms) AS last_fetched_at_ms
+                FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                GROUP BY market, exchange, symbol, metric, period, data_kind
+                ORDER BY exchange, symbol, metric, period, data_kind
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_derivatives_collection_runs(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        with self._session() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM derivatives_collection_runs
+                WHERE market=? AND exchange=? AND symbol=?
+                ORDER BY fetched_at_ms DESC LIMIT ?
+                """,
+                (market, exchange, symbol.upper(), min(max(int(limit), 1), 100)),
+            ).fetchall()
+        return [
+            {
+                "run_id": row["run_id"],
+                "period": row["period"],
+                "start_time_ms": row["start_time_ms"],
+                "end_time_ms": row["end_time_ms"],
+                "fetched_at_ms": row["fetched_at_ms"],
+                "status": row["status"],
+                "metrics": self._decode(row["metrics_json"], {}),
+                "note": row["note"],
+            }
+            for row in rows
+        ]
+
+    def save_derivatives_snapshot(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        context: dict[str, Any],
+        source_endpoint: str,
+    ) -> int:
+        fetched_at_ms = int(context.get("data_timestamp") or 0)
+        if fetched_at_ms <= 0:
+            raise ValueError("Snapshot data_timestamp must be a positive millisecond timestamp")
+        quality = context.get("data_quality") or {}
+        excluded = {
+            "symbol", "exchange", "data_timestamp", "data_quality",
+            "stats_history", "funding_rate_history",
+        }
+        observations = []
+        for metric, value in context.items():
+            if metric in excluded or value is None:
+                continue
+            observations.append(
+                {
+                    "market": market,
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "metric": metric,
+                    "period": str(context.get("stats_interval") or ""),
+                    "event_time_ms": fetched_at_ms,
+                    "fetched_at_ms": fetched_at_ms,
+                    "data_kind": "snapshot",
+                    "value": {"value": value},
+                    "raw": context,
+                    "source_endpoint": source_endpoint,
+                    "quality": str(quality.get(metric, "snapshot")),
+                }
+            )
+        return self.upsert_derivatives_observations(observations)
 
     def upsert_market_candles(
         self,

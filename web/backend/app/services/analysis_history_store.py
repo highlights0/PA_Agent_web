@@ -110,6 +110,30 @@ class AnalysisHistoryStore:
                     ON segment_samples(market, exchange, symbol, timeframe, decision_time_ms);
                 CREATE INDEX IF NOT EXISTS idx_segments_split
                     ON segment_samples(split, regime);
+
+                CREATE TABLE IF NOT EXISTS market_candles (
+                    market TEXT NOT NULL,
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    open_time_ms INTEGER NOT NULL,
+                    close_time_ms INTEGER NOT NULL,
+                    open TEXT NOT NULL,
+                    high TEXT NOT NULL,
+                    low TEXT NOT NULL,
+                    close TEXT NOT NULL,
+                    volume TEXT NOT NULL,
+                    quote_volume TEXT NOT NULL DEFAULT '',
+                    trades INTEGER,
+                    taker_buy_base_volume TEXT NOT NULL DEFAULT '',
+                    taker_buy_quote_volume TEXT NOT NULL DEFAULT '',
+                    volume_unit TEXT NOT NULL DEFAULT 'base_asset',
+                    contract_volume TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (market, exchange, symbol, timeframe, open_time_ms)
+                );
+                CREATE INDEX IF NOT EXISTS idx_market_candles_instrument_time
+                    ON market_candles(market, exchange, symbol, timeframe, open_time_ms);
                 """
             )
             # A process-local job cannot survive a backend restart. Mark any
@@ -342,6 +366,202 @@ class AnalysisHistoryStore:
                 (search_id, owner_key(owner)),
             )
         return cursor.rowcount > 0
+
+    def upsert_market_candles(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        candles: list[Any],
+    ) -> int:
+        """Persist completed OHLCV candles with source/instrument identity."""
+        def value(candle: Any, key: str, default: Any = None) -> Any:
+            if isinstance(candle, dict):
+                return candle.get(key, default)
+            return getattr(candle, key, default)
+
+        rows = []
+        for candle in candles:
+            if not bool(value(candle, "closed", False)):
+                continue
+            rows.append(
+                (
+                    market,
+                    exchange,
+                    symbol.upper(),
+                    timeframe,
+                    int(value(candle, "open_time")),
+                    int(value(candle, "close_time")),
+                    str(value(candle, "open")),
+                    str(value(candle, "high")),
+                    str(value(candle, "low")),
+                    str(value(candle, "close")),
+                    str(value(candle, "volume")),
+                    str(value(candle, "quote_volume", "") or ""),
+                    value(candle, "trades"),
+                    str(value(candle, "taker_buy_base_volume", "") or ""),
+                    str(value(candle, "taker_buy_quote_volume", "") or ""),
+                    str(value(candle, "volume_unit", "base_asset") or "base_asset"),
+                    (
+                        str(value(candle, "contract_volume"))
+                        if value(candle, "contract_volume") is not None
+                        else None
+                    ),
+                    _now(),
+                )
+            )
+        if not rows:
+            return 0
+
+        with self._lock, self._session() as db:
+            db.executemany(
+                """
+                INSERT INTO market_candles (
+                    market, exchange, symbol, timeframe, open_time_ms, close_time_ms,
+                    open, high, low, close, volume, quote_volume, trades,
+                    taker_buy_base_volume, taker_buy_quote_volume, volume_unit,
+                    contract_volume, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(market, exchange, symbol, timeframe, open_time_ms)
+                DO UPDATE SET
+                    close_time_ms=excluded.close_time_ms,
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    volume=excluded.volume,
+                    quote_volume=excluded.quote_volume,
+                    trades=excluded.trades,
+                    taker_buy_base_volume=excluded.taker_buy_base_volume,
+                    taker_buy_quote_volume=excluded.taker_buy_quote_volume,
+                    volume_unit=excluded.volume_unit,
+                    contract_volume=excluded.contract_volume,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+        return len(rows)
+
+    def market_candle_coverage(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+    ) -> dict[str, int | None]:
+        with self._session() as db:
+            row = db.execute(
+                """
+                SELECT COUNT(*) AS candle_count,
+                       MIN(open_time_ms) AS oldest_open_time_ms,
+                       MAX(open_time_ms) AS newest_open_time_ms
+                FROM market_candles
+                WHERE market=? AND exchange=? AND symbol=? AND timeframe=?
+                """,
+                (market, exchange, symbol.upper(), timeframe),
+            ).fetchone()
+        return {
+            "candle_count": int(row["candle_count"]),
+            "oldest_open_time_ms": row["oldest_open_time_ms"],
+            "newest_open_time_ms": row["newest_open_time_ms"],
+        }
+
+    def list_market_candles(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 30000,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "market=?",
+            "exchange=?",
+            "symbol=?",
+            "timeframe=?",
+        ]
+        params: list[Any] = [market, exchange, symbol.upper(), timeframe]
+        if start_ms is not None:
+            clauses.append("open_time_ms>=?")
+            params.append(int(start_ms))
+        if end_ms is not None:
+            clauses.append("open_time_ms<=?")
+            params.append(int(end_ms))
+        params.append(min(max(int(limit), 1), 50000))
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT * FROM (
+                    SELECT * FROM market_candles
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY open_time_ms DESC
+                    LIMIT ?
+                ) ORDER BY open_time_ms ASC
+                """,
+                params,
+            ).fetchall()
+        return [
+            {
+                "open_time": row["open_time_ms"],
+                "close_time": row["close_time_ms"],
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+                "quote_volume": row["quote_volume"],
+                "trades": row["trades"],
+                "taker_buy_base_volume": row["taker_buy_base_volume"],
+                "taker_buy_quote_volume": row["taker_buy_quote_volume"],
+                "closed": True,
+                "exchange": row["exchange"],
+                "market_type": row["market"],
+                "volume_unit": row["volume_unit"],
+                "contract_volume": row["contract_volume"],
+            }
+            for row in rows
+        ]
+
+    def market_candle_stats(
+        self,
+        *,
+        market: str | None = None,
+        exchange: str | None = None,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["1=1"]
+        params: list[Any] = []
+        for column, value in (
+            ("market", market),
+            ("exchange", exchange),
+            ("symbol", symbol.upper() if symbol else None),
+            ("timeframe", timeframe),
+        ):
+            if value:
+                clauses.append(f"{column}=?")
+                params.append(value)
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT market, exchange, symbol, timeframe,
+                       COUNT(*) AS candle_count,
+                       MIN(open_time_ms) AS oldest_open_time_ms,
+                       MAX(open_time_ms) AS newest_open_time_ms
+                FROM market_candles
+                WHERE {' AND '.join(clauses)}
+                GROUP BY market, exchange, symbol, timeframe
+                ORDER BY exchange, market, symbol, timeframe
+                """,
+                params,
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def upsert_segments(self, samples: list[dict[str, Any]]) -> int:
         if not samples:

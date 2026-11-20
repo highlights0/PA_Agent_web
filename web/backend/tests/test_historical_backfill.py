@@ -161,3 +161,26 @@ def test_backfill_rejects_unsupported_market_exchange_pair():
                 requested_bars=80,
             )
         )
+
+
+
+def test_backfill_resume_starts_before_oldest_archived_candle():
+    service = FakeMarketService(_candles(120))
+
+    result = asyncio.run(
+        backfill_market_candles(
+            service,
+            market="spot",
+            exchange="binance",
+            symbol="BTCUSDT",
+            timeframe="1m",
+            requested_bars=80,
+            before_open_time_ms=80 * 60_000,
+        )
+    )
+
+    assert result["closed_bars"] == 80
+    assert result["bars"][0].open_time == 0
+    assert result["bars"][-1].open_time == 79 * 60_000
+    assert len(service.range_calls) == 1
+    assert service.range_calls[0]["end_ms"] == 79 * 60_000

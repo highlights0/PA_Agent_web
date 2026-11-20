@@ -58,6 +58,15 @@ async def backfill_market_candles(
 
     # Fail fast for unsupported market/exchange combinations.
     market_service._provider(market, exchange)
+    # Keep the established Gate range-pagination path unchanged; its API has
+    # different from/to semantics and its behavior is covered by existing tests.
+    if exchange == "gate":
+        return await backfill_gate_candles(
+            market_service._gate_futures,
+            symbol=symbol,
+            timeframe=timeframe,
+            requested_bars=requested_bars,
+        )
     page_limit = _PAGE_LIMITS.get(exchange)
     if page_limit is None:
         raise ValueError(f"Historical backfill is not configured for {exchange}")

@@ -144,6 +144,7 @@ class AnalysisHistoryStore:
                     period TEXT NOT NULL DEFAULT '',
                     event_time_ms INTEGER NOT NULL,
                     fetched_at_ms INTEGER NOT NULL,
+                    available_at_ms INTEGER NOT NULL DEFAULT 0,
                     data_kind TEXT NOT NULL CHECK(data_kind IN ('historical', 'snapshot')),
                     value_json TEXT NOT NULL,
                     raw_json TEXT NOT NULL,
@@ -179,6 +180,29 @@ class AnalysisHistoryStore:
                     );
                 """
             )
+            derivative_columns = {
+                row["name"]
+                for row in db.execute("PRAGMA table_info(derivatives_observations)").fetchall()
+            }
+            if "available_at_ms" not in derivative_columns:
+                db.execute(
+                    "ALTER TABLE derivatives_observations "
+                    "ADD COLUMN available_at_ms INTEGER NOT NULL DEFAULT 0"
+                )
+                # Old historical imports did not retain publication/availability
+                # semantics. Keep them unavailable to strict replay rather than
+                # guessing when they first became usable. Old snapshots used the
+                # fetch timestamp as their event timestamp and can be retained.
+                db.execute(
+                    "UPDATE derivatives_observations "
+                    "SET available_at_ms=CASE "
+                    "WHEN data_kind='snapshot' THEN fetched_at_ms ELSE 0 END"
+                )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_derivatives_available_time "
+                "ON derivatives_observations(market, exchange, symbol, available_at_ms)"
+            )
+
             # A process-local job cannot survive a backend restart. Mark any
             # unfinished persisted record as interrupted instead of leaving it queued forever.
             db.execute(
@@ -430,6 +454,7 @@ class AnalysisHistoryStore:
                     str(item.get("period") or ""),
                     int(item["event_time_ms"]),
                     int(item["fetched_at_ms"]),
+                    int(item.get("available_at_ms", 0)),
                     data_kind,
                     self._json(item.get("value", {})),
                     self._json(item.get("raw", {})),
@@ -442,13 +467,14 @@ class AnalysisHistoryStore:
                 """
                 INSERT INTO derivatives_observations (
                     market, exchange, symbol, metric, period, event_time_ms,
-                    fetched_at_ms, data_kind, value_json, raw_json,
+                    fetched_at_ms, available_at_ms, data_kind, value_json, raw_json,
                     source_endpoint, quality
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(
                     market, exchange, symbol, metric, period, event_time_ms, data_kind
                 ) DO UPDATE SET
                     fetched_at_ms=excluded.fetched_at_ms,
+                    available_at_ms=excluded.available_at_ms,
                     value_json=excluded.value_json,
                     raw_json=excluded.raw_json,
                     source_endpoint=excluded.source_endpoint,
@@ -538,6 +564,7 @@ class AnalysisHistoryStore:
                 "period": row["period"],
                 "event_time_ms": row["event_time_ms"],
                 "fetched_at_ms": row["fetched_at_ms"],
+                "available_at_ms": row["available_at_ms"],
                 "data_kind": row["data_kind"],
                 "value": self._decode(row["value_json"], {}),
                 "raw": self._decode(row["raw_json"], {}),
@@ -546,6 +573,91 @@ class AnalysisHistoryStore:
             }
             for row in rows
         ]
+
+    def list_derivatives_observations_asof(
+        self,
+        *,
+        market: str,
+        exchange: str,
+        symbol: str,
+        decision_time_ms: int,
+        period: str | None = None,
+        include_snapshots: bool = True,
+        limit: int = 10000,
+    ) -> dict[str, Any]:
+        """Return only observations both occurring and available by the decision cutoff.
+
+        Historical records use exchange-specific publication availability times.
+        Snapshots are usable only when their actual fetch time is no later than
+        the historical decision time. Legacy historical rows with unknown
+        availability (available_at_ms=0) are deliberately excluded.
+        """
+        clauses = [
+            "market=?",
+            "exchange=?",
+            "symbol=?",
+            "event_time_ms<=?",
+            "available_at_ms>0",
+            "available_at_ms<=?",
+        ]
+        params: list[Any] = [
+            market,
+            exchange,
+            symbol.upper(),
+            int(decision_time_ms),
+            int(decision_time_ms),
+        ]
+        if period is not None:
+            clauses.append("(period=? OR metric='funding_rate')")
+            params.append(period)
+        if not include_snapshots:
+            clauses.append("data_kind='historical'")
+        params.append(min(max(int(limit), 1), 50000))
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT * FROM derivatives_observations
+                WHERE {' AND '.join(clauses)}
+                ORDER BY available_at_ms ASC, event_time_ms ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            total_rows = db.execute(
+                f"""
+                SELECT COUNT(*) FROM derivatives_observations
+                WHERE market=? AND exchange=? AND symbol=?
+                  AND event_time_ms<=?
+                """,
+                (market, exchange, symbol.upper(), int(decision_time_ms)),
+            ).fetchone()[0]
+        items = [
+            {
+                "market": row["market"],
+                "exchange": row["exchange"],
+                "symbol": row["symbol"],
+                "metric": row["metric"],
+                "period": row["period"],
+                "event_time_ms": row["event_time_ms"],
+                "fetched_at_ms": row["fetched_at_ms"],
+                "available_at_ms": row["available_at_ms"],
+                "data_kind": row["data_kind"],
+                "value": self._decode(row["value_json"], {}),
+                "raw": self._decode(row["raw_json"], {}),
+                "source_endpoint": row["source_endpoint"],
+                "quality": row["quality"],
+            }
+            for row in rows
+        ]
+        return {
+            "items": items,
+            "eligible_count": len(items),
+            "excluded_or_unavailable_count": max(0, int(total_rows) - len(items)),
+            "latest_available_at_ms": max(
+                (item["available_at_ms"] for item in items),
+                default=None,
+            ),
+        }
 
     def derivatives_archive_stats(
         self,
@@ -638,8 +750,9 @@ class AnalysisHistoryStore:
                     "symbol": symbol,
                     "metric": metric,
                     "period": str(context.get("stats_interval") or ""),
-                    "event_time_ms": fetched_at_ms,
+                    "event_time_ms": int(context.get("data_timestamp") or fetched_at_ms),
                     "fetched_at_ms": fetched_at_ms,
+                    "available_at_ms": fetched_at_ms,
                     "data_kind": "snapshot",
                     "value": {"value": value},
                     "raw": context,

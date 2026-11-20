@@ -158,6 +158,8 @@ async function buildDataset() {
       limit: props.exchange === "coinbase" ? 300 : 1000,
     });
     stats.value = result.dataset;
+    evaluation.value = null;
+    similar.value = [];
     const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
     samples.value = refreshed.items;
     notice.value = `已读取 ${result.received_bars} 根 K 线，新增 ${result.new_samples} 个历史样本。`;
@@ -181,10 +183,12 @@ async function backfillHistory() {
       bars: backfillCount.value,
     });
     stats.value = result.dataset;
-    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本。`;
+    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本。` +
+      (result.truncated ? " 数据源可用历史不足或已达到分页上限。" : "");
     const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
     samples.value = refreshed.items;
     evaluation.value = null;
+    similar.value = [];
   } catch (err) {
     error.value = err instanceof Error ? err.message : "历史回补失败";
   } finally {

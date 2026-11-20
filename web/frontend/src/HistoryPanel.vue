@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   api,
   type AnalysisComparison,
@@ -10,6 +10,8 @@ import {
   type SearchHistoryItem,
   type SegmentSample,
   type DatasetStats,
+  type BatchBackfillJob,
+  type MarketCandleArchiveStats,
 } from "./api";
 
 const props = defineProps<{
@@ -34,6 +36,13 @@ const comparison = ref<AnalysisComparison | null>(null);
 const stats = ref<DatasetStats | null>(null);
 const samples = ref<SegmentSample[]>([]);
 const similar = ref<SegmentSample[]>([]);
+const candleArchive = ref<MarketCandleArchiveStats | null>(null);
+const batchSymbolsInput = ref("");
+const batchTimeframes = ref<string[]>(["15m", "1h", "4h"]);
+const batchBars = ref(3000);
+const batchJob = ref<BatchBackfillJob | null>(null);
+const batching = ref(false);
+let batchPollTimer: ReturnType<typeof setTimeout> | undefined;
 const loading = ref(false);
 const building = ref(false);
 const backfilling = ref(false);
@@ -54,6 +63,33 @@ const datasetQuery = computed(() => ({
   symbol: props.symbol,
   timeframe: props.timeframe,
 }));
+
+const batchTimeframeOptions = computed(() => {
+  if (props.exchange === "coinbase") return ["1m", "5m", "15m", "1h", "6h", "1d"];
+  if (props.exchange === "gate") return ["1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"];
+  return ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"];
+});
+const defaultBatchSymbols = computed(() =>
+  props.exchange === "coinbase"
+    ? "BTC-USD, ETH-USD"
+    : "BTCUSDT, ETHUSDT, NEARUSDT",
+);
+const batchProgress = computed(() =>
+  batchJob.value && batchJob.value.total > 0
+    ? Math.round((batchJob.value.completed / batchJob.value.total) * 100)
+    : 0,
+);
+
+watch(
+  () => [props.market, props.exchange],
+  () => {
+    batchSymbolsInput.value = "";
+    batchTimeframes.value = props.exchange === "coinbase"
+      ? ["15m", "1h", "6h"]
+      : ["15m", "1h", "4h"];
+    batchJob.value = null;
+  },
+);
 
 function formatTime(value: string | number | null | undefined) {
   if (!value) return "--";
@@ -83,16 +119,18 @@ async function refreshHistory() {
   loading.value = true;
   error.value = "";
   try {
-    const [analysisResult, searchResult, datasetResult, sampleResult] = await Promise.all([
+    const [analysisResult, searchResult, datasetResult, sampleResult, candleResult] = await Promise.all([
       api.listAnalysisHistory(100),
       api.listSearches(100),
       api.datasetStats(datasetQuery.value),
       api.listDatasetSamples({ ...datasetQuery.value, limit: 100 }),
+      api.marketCandleStats(datasetQuery.value),
     ]);
     analyses.value = analysisResult.items;
     searches.value = searchResult.items;
     stats.value = datasetResult;
     samples.value = sampleResult.items;
+    candleArchive.value = candleResult.items[0] ?? null;
   } catch (err) {
     error.value = err instanceof Error ? err.message : "读取历史记录失败";
   } finally {
@@ -160,8 +198,12 @@ async function buildDataset() {
     stats.value = result.dataset;
     evaluation.value = null;
     similar.value = [];
-    const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
+    const [refreshed, archive] = await Promise.all([
+      api.listDatasetSamples({ ...datasetQuery.value, limit: 100 }),
+      api.marketCandleStats(datasetQuery.value),
+    ]);
     samples.value = refreshed.items;
+    candleArchive.value = archive.items[0] ?? null;
     notice.value = `已读取 ${result.received_bars} 根 K 线，新增 ${result.new_samples} 个历史样本。`;
   } catch (err) {
     error.value = err instanceof Error ? err.message : "构建历史样本失败";
@@ -183,10 +225,14 @@ async function backfillHistory() {
       bars: backfillCount.value,
     });
     stats.value = result.dataset;
-    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本。` +
+    notice.value = `已回补 ${result.received_bars} 根已收盘 K 线，共 ${result.pages} 页，缺口 ${result.gaps} 处，新增 ${result.new_samples} 个样本；归档总计 ${result.archive_candles} 根。` +
       (result.truncated ? " 数据源可用历史不足或已达到分页上限。" : "");
-    const refreshed = await api.listDatasetSamples({ ...datasetQuery.value, limit: 100 });
+    const [refreshed, archive] = await Promise.all([
+      api.listDatasetSamples({ ...datasetQuery.value, limit: 100 }),
+      api.marketCandleStats(datasetQuery.value),
+    ]);
     samples.value = refreshed.items;
+    candleArchive.value = archive.items[0] ?? null;
     evaluation.value = null;
     similar.value = [];
   } catch (err) {
@@ -195,6 +241,75 @@ async function backfillHistory() {
     backfilling.value = false;
   }
 }
+
+async function pollBatchBackfill(jobId: string) {
+  try {
+    const job = await api.getBatchBackfill(jobId);
+    batchJob.value = job;
+    if (job.status === "queued" || job.status === "running") {
+      batchPollTimer = setTimeout(() => void pollBatchBackfill(jobId), 1200);
+      return;
+    }
+    batching.value = false;
+    await refreshHistory();
+    const successful = job.results.filter((item) => item.status === "completed").length;
+    const failed = job.results.length - successful;
+    notice.value = `批量采集完成：成功 ${successful}/${job.total}，失败 ${failed}。已归档数据可在下次任务中续传。`;
+  } catch (err) {
+    batching.value = false;
+    error.value = err instanceof Error ? err.message : "读取批量回补进度失败";
+  }
+}
+
+async function startBatchBackfill() {
+  error.value = "";
+  notice.value = "";
+  const symbols = (batchSymbolsInput.value.trim() || defaultBatchSymbols.value)
+    .split(/[,，;；\\s]+/)
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+  const timeframes = [...new Set(batchTimeframes.value)];
+  if (!symbols.length) {
+    error.value = "请至少输入一个交易对。";
+    return;
+  }
+  if (!timeframes.length) {
+    error.value = "请至少选择一个 K 线周期。";
+    return;
+  }
+  const jobs = symbols.flatMap((item) =>
+    timeframes.map((period) => ({
+      market: props.market,
+      exchange: props.exchange,
+      symbol: item,
+      timeframe: period,
+      bars: batchBars.value,
+    })),
+  );
+  if (jobs.length > 24) {
+    error.value = "单批最多支持 24 个交易对与周期组合。";
+    return;
+  }
+  if (jobs.length * batchBars.value > 60000) {
+    error.value = "单批回补总量不能超过 60000 根 K 线，请减少组合或回补数量。";
+    return;
+  }
+  batching.value = true;
+  batchJob.value = null;
+  if (batchPollTimer) clearTimeout(batchPollTimer);
+  try {
+    const job = await api.startBatchBackfill(jobs);
+    batchJob.value = job;
+    void pollBatchBackfill(job.job_id);
+  } catch (err) {
+    batching.value = false;
+    error.value = err instanceof Error ? err.message : "启动批量历史采集失败";
+  }
+}
+
+onBeforeUnmount(() => {
+  if (batchPollTimer) clearTimeout(batchPollTimer);
+});
 
 async function evaluateBaseline() {
   evaluating.value = true;

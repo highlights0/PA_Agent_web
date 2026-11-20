@@ -432,7 +432,7 @@ export const api = {
   buildHistoricalDataset: (payload: {
     market: Market; exchange: Exchange; symbol: string; timeframe: string; limit: number;
   }) =>
-    request<{ requested_bars: number; received_bars: number; closed_bars: number; new_samples: number; dataset: DatasetStats; note: string }>(
+    request<{ requested_bars: number; received_bars: number; closed_bars: number; stored_candles: number; archive_candles: number; new_samples: number; dataset: DatasetStats; note: string }>(
       "/api/v1/history/dataset/build",
       { method: "POST", body: JSON.stringify(payload) },
     ),
@@ -440,8 +440,8 @@ export const api = {
     market: Market; exchange: Exchange; symbol: string; timeframe: string; bars: number;
   }) =>
     request<{
-      requested_bars: number; received_bars: number; pages: number;
-      gaps: number; truncated: boolean; new_samples: number;
+      requested_bars: number; received_bars: number; stored_candles: number; archive_candles: number;
+      pages: number; gaps: number; truncated: boolean; new_samples: number;
       dataset: DatasetStats; note: string;
     }>("/api/v1/history/dataset/backfill", {
       method: "POST", body: JSON.stringify(payload),

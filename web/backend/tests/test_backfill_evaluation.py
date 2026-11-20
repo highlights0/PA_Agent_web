@@ -48,7 +48,7 @@ def test_backfill_gaps_are_not_filled_or_labeled_across(monkeypatch):
     monkeypatch.setattr("app.services.historical_backfill.time.time", lambda: 6_000_035)
     target = (6_000_035 // 60) * 60 - 60 - 45 * 60
     gate = FakeGate(missing={target})
-    result = await backfill_gate_candles(
+    result = asyncio.run(backfill_gate_candles(
         gate, symbol="BTCUSDT", timeframe="1m", requested_bars=150
     ))
     assert result["gaps"] >= 1

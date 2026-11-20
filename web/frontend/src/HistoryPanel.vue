@@ -38,7 +38,7 @@ const samples = ref<SegmentSample[]>([]);
 const similar = ref<SegmentSample[]>([]);
 const candleArchive = ref<MarketCandleArchiveStats | null>(null);
 const batchSymbolsInput = ref("");
-const batchTimeframes = ref<string[]>(["15m", "1h", "4h"]);
+const batchTimeframes = ref<string[]>(props.exchange === "coinbase" ? ["15m", "1h", "6h"] : ["15m", "1h", "4h"]);
 const batchBars = ref(3000);
 const batchJob = ref<BatchBackfillJob | null>(null);
 const batching = ref(false);

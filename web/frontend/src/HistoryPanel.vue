@@ -275,7 +275,7 @@ function initializeDerivativesDateRange() {
 }
 
 async function refreshDerivativesArchive() {
-  if (props.market !== "usdm" || !["binance", "gate"].includes(props.exchange)) {
+  if (props.market !== "usdm" || (props.exchange !== "binance" && props.exchange !== "gate")) {
     derivativesArchive.value = [];
     return;
   }
@@ -292,7 +292,7 @@ async function refreshDerivativesArchive() {
 }
 
 async function backfillDerivativesHistory() {
-  if (props.market !== "usdm" || !["binance", "gate"].includes(props.exchange)) return;
+  if (props.market !== "usdm" || (props.exchange !== "binance" && props.exchange !== "gate")) return;
   const startMs = new Date(derivativesStart.value).getTime();
   const endMs = new Date(derivativesEnd.value).getTime();
   if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {

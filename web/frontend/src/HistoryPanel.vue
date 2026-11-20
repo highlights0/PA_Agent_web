@@ -169,14 +169,15 @@ async function buildDataset() {
 }
 
 async function backfillHistory() {
-  if (props.market !== "usdm" || props.exchange !== "gate") return;
   backfilling.value = true;
   error.value = "";
   notice.value = "";
   try {
     const result = await api.backfillDataset({
-      market: "usdm", exchange: "gate",
-      symbol: props.symbol, timeframe: props.timeframe,
+      market: props.market,
+      exchange: props.exchange,
+      symbol: props.symbol,
+      timeframe: props.timeframe,
       bars: backfillCount.value,
     });
     stats.value = result.dataset;
@@ -364,7 +365,7 @@ onMounted(() => void refreshHistory());
               {{ building ? "构建中…" : "构建历史样本" }}
             </button>
           </div>
-          <div v-if="market === 'usdm' && exchange === 'gate'" class="history-dataset-actions">
+          <div class="history-dataset-actions">
             <label class="history-backfill-count">
               <span>回补 K 线</span>
               <select v-model.number="backfillCount">
@@ -375,7 +376,7 @@ onMounted(() => void refreshHistory());
               </select>
             </label>
             <button class="secondary-button" :disabled="backfilling" @click="backfillHistory">
-              {{ backfilling ? "历史分页回补中…" : "Gate 历史分页回补" }}
+              {{ backfilling ? "历史分页回补中…" : "历史分页回补" }}
             </button>
           </div>
           <div class="history-dataset-actions">

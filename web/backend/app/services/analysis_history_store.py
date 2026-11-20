@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -620,9 +621,7 @@ class AnalysisHistoryStore:
         context: dict[str, Any],
         source_endpoint: str,
     ) -> int:
-        fetched_at_ms = int(context.get("data_timestamp") or 0)
-        if fetched_at_ms <= 0:
-            raise ValueError("Snapshot data_timestamp must be a positive millisecond timestamp")
+        fetched_at_ms = int(time.time() * 1000)
         quality = context.get("data_quality") or {}
         excluded = {
             "symbol", "exchange", "data_timestamp", "data_quality",

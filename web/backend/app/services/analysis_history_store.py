@@ -627,9 +627,8 @@ class AnalysisHistoryStore:
                 f"""
                 SELECT COUNT(*) FROM derivatives_observations
                 WHERE market=? AND exchange=? AND symbol=?
-                  AND event_time_ms<=?
                 """,
-                (market, exchange, symbol.upper(), int(decision_time_ms)),
+                (market, exchange, symbol.upper()),
             ).fetchone()[0]
         items = [
             {

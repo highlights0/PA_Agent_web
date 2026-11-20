@@ -265,7 +265,7 @@ async function startBatchBackfill() {
   error.value = "";
   notice.value = "";
   const symbols = (batchSymbolsInput.value.trim() || defaultBatchSymbols.value)
-    .split(/[,，;；\\s]+/)
+    .split(/[,，;；\s]+/)
     .map((item) => item.trim().toUpperCase())
     .filter(Boolean);
   const timeframes = [...new Set(batchTimeframes.value)];

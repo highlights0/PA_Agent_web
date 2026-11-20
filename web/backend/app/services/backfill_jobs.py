@@ -43,7 +43,7 @@ class BackfillJobStore:
         finished = sorted(
             (job.get("updated_at", ""), key)
             for key, job in self._jobs.items()
-            if job.get("status") in {"completed", "failed"}
+            if job.get("status") in {"completed", "partial", "failed"}
         )
         for _, key in finished[: max(0, len(self._jobs) - self._max_jobs)]:
             self._jobs.pop(key, None)

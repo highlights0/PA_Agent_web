@@ -186,6 +186,52 @@ export interface DatasetStats {
   note: string;
 }
 
+export interface MarketCandleArchiveStats {
+  market: Market;
+  exchange: Exchange;
+  symbol: string;
+  timeframe: string;
+  candle_count: number;
+  oldest_open_time_ms: number | null;
+  newest_open_time_ms: number | null;
+}
+
+export interface BatchBackfillResult {
+  status: "completed" | "failed";
+  market: Market;
+  exchange: Exchange;
+  symbol: string;
+  timeframe: string;
+  requested_bars: number;
+  received_bars?: number;
+  stored_candles?: number;
+  archive_candles?: number;
+  pages?: number;
+  gaps?: number;
+  truncated?: boolean;
+  new_samples?: number;
+  error?: string;
+}
+
+export interface BatchBackfillJob {
+  job_id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  total: number;
+  completed: number;
+  current: {
+    market: Market;
+    exchange: Exchange;
+    symbol: string;
+    timeframe: string;
+    bars: number;
+    index: number;
+  } | null;
+  results: BatchBackfillResult[];
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
 export interface SegmentSample {
   sample_id: string;
   market: Market;
@@ -400,6 +446,27 @@ export const api = {
     }>("/api/v1/history/dataset/backfill", {
       method: "POST", body: JSON.stringify(payload),
     }),
+  startBatchBackfill: (jobs: Array<{
+    market: Market; exchange: Exchange; symbol: string; timeframe: string; bars: number;
+  }>) =>
+    request<BatchBackfillJob>("/api/v1/history/dataset/batch-backfill", {
+      method: "POST",
+      body: JSON.stringify({ jobs }),
+    }),
+  getBatchBackfill: (jobId: string) =>
+    request<BatchBackfillJob>(
+      "/api/v1/history/dataset/batch-backfill/" + encodeURIComponent(jobId),
+    ),
+  marketCandleStats: (payload: {
+    market?: Market; exchange?: Exchange; symbol?: string; timeframe?: string;
+  } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(payload).filter((entry): entry is [string, string] => Boolean(entry[1])),
+    );
+    return request<{ items: MarketCandleArchiveStats[] }>(
+      "/api/v1/history/candles/stats?" + query.toString(),
+    );
+  },
   evaluateDataset: (payload: { market: Market; exchange: Exchange; symbol: string; timeframe: string }) => {
     const query = new URLSearchParams(payload);
     return request<{

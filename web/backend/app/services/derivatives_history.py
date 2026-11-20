@@ -12,6 +12,11 @@ import uuid
 from typing import Any, Awaitable, Callable
 
 _BINANCE_PERIODS = {"5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"}
+_BINANCE_PERIOD_MS = {
+    "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
+    "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+    "6h": 21_600_000, "12h": 43_200_000, "1d": 86_400_000,
+}
 _GATE_PERIOD_SECONDS = {
     "5m": 300,
     "15m": 900,
@@ -201,6 +206,14 @@ async def _collect_binance_metric(
                 continue
             latest_event = max(latest_event, event_time)
             normalized = _normalize_binance(metric, row)
+            # Funding timestamps are settlement events. Binance period-based
+            # statistics are bucket observations and are not usable until the
+            # full bucket has elapsed.
+            available_at = (
+                event_time
+                if metric == "funding_rate"
+                else event_time + _BINANCE_PERIOD_MS[period]
+            )
             observations.append(
                 {
                     "market": "usdm",
@@ -210,6 +223,7 @@ async def _collect_binance_metric(
                     "period": "" if metric == "funding_rate" else period,
                     "event_time_ms": event_time,
                     "fetched_at_ms": fetched_at_ms,
+                    "available_at_ms": available_at,
                     "data_kind": "historical",
                     "value": normalized,
                     "raw": row,
@@ -281,6 +295,7 @@ async def _collect_gate_history(
                     "period": "",
                     "event_time_ms": event_ms,
                     "fetched_at_ms": fetched_at_ms,
+                    "available_at_ms": event_ms,
                     "data_kind": "historical",
                     "value": {"funding_rate": row.get("r")},
                     "raw": row,
@@ -333,6 +348,7 @@ async def _collect_gate_history(
                         "period": period,
                         "event_time_ms": event_ms,
                         "fetched_at_ms": fetched_at_ms,
+                        "available_at_ms": event_ms + interval_seconds * 1000,
                         "data_kind": "historical",
                         "value": normalized,
                         "raw": row,

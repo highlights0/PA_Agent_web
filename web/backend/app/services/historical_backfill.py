@@ -56,6 +56,17 @@ async def backfill_market_candles(
             f"requested_bars must be between {_MIN_BARS} and {_MAX_BARS}"
         )
 
+    # No candle can exist before the Unix epoch; avoid issuing a negative Gate range.
+    if before_open_time_ms is not None and int(before_open_time_ms) <= 0:
+        return {
+            "bars": [],
+            "pages": 0,
+            "gaps": 0,
+            "closed_bars": 0,
+            "source": exchange,
+            "truncated": True,
+        }
+
     # Fail fast for unsupported market/exchange combinations.
     market_service._provider(market, exchange)
     # Keep the established Gate range-pagination path unchanged; its API has

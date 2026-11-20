@@ -474,6 +474,9 @@ class AnalysisService:
                 period=period,
                 decision_time_ms=decision_time_ms,
             )
+            derivative_provenance["eligible_observation_count"] = asof["eligible_count"]
+            derivative_provenance["returned_observation_count"] = asof["returned_count"]
+            derivative_provenance["observation_query_truncated"] = asof["truncated"]
             derivative_provenance["excluded_or_unavailable_count"] = asof[
                 "excluded_or_unavailable_count"
             ]

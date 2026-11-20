@@ -696,7 +696,11 @@ class AnalysisHistoryStore:
                 """,
                 (market, exchange, symbol.upper(), timeframe, int(before_ms)),
             ).fetchall()
-        candidates = [self._segment_row(row) for row in rows]
+        candidates = [
+            item
+            for item in (self._segment_row(row) for row in rows)
+            if 0 < int((item.get("labels") or {}).get("future_end_ms", 0)) <= int(before_ms)
+        ]
         for item in candidates:
             item["similarity"] = similarity_score(
                 {"regime": features.get("regime"), "features": features.get("features", {})},

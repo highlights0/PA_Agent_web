@@ -46,6 +46,33 @@ class CoinbaseSpotREST:
         )
         return list(reversed(rows))
 
+    async def klines_range(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        start_ms: int,
+        end_ms: int,
+        limit: int = 300,
+    ) -> list[Any]:
+        if interval not in _GRANULARITY_SECONDS:
+            raise ValueError(
+                f"Coinbase does not provide {interval} candles; supported: "
+                + ", ".join(_GRANULARITY_SECONDS)
+            )
+        if start_ms < 0 or end_ms < start_ms:
+            raise ValueError("Invalid Coinbase historical candle time range")
+        seconds = _GRANULARITY_SECONDS[interval]
+        # Coinbase caps each response at 300 candles. Its end boundary is
+        # exclusive, so add one second to include the requested final open time.
+        start = int(start_ms // 1000)
+        end = int(end_ms // 1000) + 1
+        rows = await self._client.get(
+            f"/products/{self.product_id(symbol)}/candles",
+            {"start": start, "end": end, "granularity": seconds},
+        )
+        return list(reversed(rows))
+
     async def ticker_24h(self, symbol: str) -> dict[str, Any]:
         product = self.product_id(symbol)
         stats = await self._client.get(f"/products/{product}/stats")

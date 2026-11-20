@@ -42,12 +42,12 @@ async def backfill_market_candles(
     symbol: str,
     timeframe: str,
     requested_bars: int,
+    before_open_time_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Fetch the newest requested number of closed candles, oldest page first.
+    """Fetch completed candles before an optional archive boundary.
 
-    Page boundaries are expressed as inclusive candle open times. Missing
-    candles are preserved as gaps; downstream sample generation rejects any
-    feature/label window that crosses a gap.
+    Page boundaries are inclusive candle open times. Missing candles remain
+    gaps and downstream sample generation never bridges them.
     """
     if timeframe not in _INTERVAL_MS:
         raise ValueError(f"Unsupported historical candle interval: {timeframe}")
@@ -66,20 +66,36 @@ async def backfill_market_candles(
             symbol=symbol,
             timeframe=timeframe,
             requested_bars=requested_bars,
+            end_ms=(
+                int(before_open_time_ms) + 1
+                if before_open_time_ms is not None
+                else None
+            ),
         )
     page_limit = _PAGE_LIMITS.get(exchange)
     if page_limit is None:
         raise ValueError(f"Historical backfill is not configured for {exchange}")
 
-    recent = await market_service.klines(
-        market, symbol, timeframe, min(5, page_limit), exchange
-    )
-    closed_recent = [item for item in recent if item.closed]
-    if not closed_recent:
-        raise ValueError("The exchange returned no completed candles")
-
     step_ms = _INTERVAL_MS[timeframe]
-    cursor = max(item.open_time for item in closed_recent)
+    if before_open_time_ms is None:
+        recent = await market_service.klines(
+            market, symbol, timeframe, min(5, page_limit), exchange
+        )
+        closed_recent = [item for item in recent if item.closed]
+        if not closed_recent:
+            raise ValueError("The exchange returned no completed candles")
+        cursor = max(item.open_time for item in closed_recent)
+    else:
+        cursor = int(before_open_time_ms) - step_ms
+        if cursor < 0:
+            return {
+                "bars": [],
+                "pages": 0,
+                "gaps": 0,
+                "closed_bars": 0,
+                "source": exchange,
+                "truncated": True,
+            }
     seen: dict[int, Any] = {}
     pages = 0
     empty_pages = 0

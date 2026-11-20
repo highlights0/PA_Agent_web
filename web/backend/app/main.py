@@ -79,6 +79,9 @@ async def lifespan(app: FastAPI):
     app.state.backfill_jobs = BackfillJobStore()
     app.state.backfill_tasks = set()
     app.state.backfill_semaphore = asyncio.Semaphore(1)
+    app.state.replay_jobs = BackfillJobStore()
+    app.state.replay_tasks = set()
+    app.state.replay_semaphore = asyncio.Semaphore(1)
     app.state.analysis_quota = PublicAnalysisQuota(settings.public_analysis_per_ip_daily)
     app.state.analysis_semaphore = asyncio.Semaphore(
         max(1, settings.public_max_concurrent_analyses)

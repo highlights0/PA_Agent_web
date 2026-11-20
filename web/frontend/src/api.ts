@@ -391,7 +391,7 @@ export const api = {
       { method: "POST", body: JSON.stringify(payload) },
     ),
   backfillDataset: (payload: {
-    market: "usdm"; exchange: "gate"; symbol: string; timeframe: string; bars: number;
+    market: Market; exchange: Exchange; symbol: string; timeframe: string; bars: number;
   }) =>
     request<{
       requested_bars: number; received_bars: number; pages: number;

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.v1.ai_settings import _authorize
 from app.services.historical_backfill import backfill_market_candles
 from app.services.derivatives_history import collect_derivatives_history
+from app.services.historical_replay import context_period
 from app.services.baseline_evaluation import evaluate_rule_baseline
 from app.services.segmenter import build_current_features, build_segment_samples
 
@@ -232,6 +233,18 @@ class DerivativesBackfillInput(BaseModel):
     period: str = Field(default="15m", min_length=2, max_length=8)
     start_ms: int = Field(ge=0)
     end_ms: int = Field(ge=0)
+
+
+class HistoricalReplayInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    market: Literal["spot", "usdm"]
+    exchange: Literal["binance", "binance_us", "coinbase", "gate"]
+    symbol: str = Field(min_length=3, max_length=32)
+    timeframe: str = Field(min_length=2, max_length=8)
+    analysis_bars: int = Field(default=100, ge=20, le=250)
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
+    points: int = Field(default=5, ge=1, le=20)
 
 
 @router.post("/history/dataset/backfill")
@@ -458,6 +471,215 @@ async def get_batch_backfill(job_id: str, request: Request):
     job = request.app.state.backfill_jobs.get(job_id, _owner(request))
     if job is None:
         raise HTTPException(status_code=404, detail="批量回补任务不存在或已过期")
+    return job
+
+
+def _replay_interval_ms(timeframe: str) -> int | None:
+    return {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000,
+        "15m": 900_000, "30m": 1_800_000,
+        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
+        "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
+        "1d": 86_400_000, "3d": 259_200_000,
+        "1w": 604_800_000, "7d": 604_800_000,
+    }.get(timeframe)
+
+
+@router.post("/history/replay", status_code=202)
+async def start_historical_replay(payload: HistoricalReplayInput, request: Request):
+    symbol = _symbol(payload.symbol)
+    if payload.market == "usdm" and payload.exchange not in {"binance", "gate"}:
+        raise HTTPException(status_code=422, detail="USDT 永续历史回放仅支持 Binance 和 Gate")
+    if payload.market == "spot" and payload.exchange == "gate":
+        raise HTTPException(status_code=422, detail="Gate 现货历史回放暂不支持")
+    interval_ms = _replay_interval_ms(payload.timeframe)
+    if interval_ms is None:
+        raise HTTPException(status_code=422, detail="当前周期暂不支持历史回放")
+    if payload.end_ms < payload.start_ms:
+        raise HTTPException(status_code=422, detail="结束时间不能早于开始时间")
+    now_ms = int(time.time() * 1000)
+    if payload.end_ms >= now_ms:
+        raise HTTPException(status_code=422, detail="历史回放结束时间必须早于当前时间")
+    if payload.end_ms - payload.start_ms > 366 * 24 * 60 * 60 * 1000:
+        raise HTTPException(status_code=422, detail="单次回放时间范围不能超过 366 天")
+    if payload.analysis_bars + 50 > request.app.state.settings.max_klines:
+        raise HTTPException(status_code=422, detail="分析 K 线数量超过服务器限制")
+
+    required_bars = payload.analysis_bars + 50
+    archived = await asyncio.to_thread(
+        _history(request).list_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        end_ms=payload.end_ms,
+        limit=50000,
+    )
+    if len(archived) < required_bars:
+        raise HTTPException(
+            status_code=422,
+            detail=f"归档只有 {len(archived)} 根 K 线，至少需要 {required_bars} 根",
+        )
+
+    candidates: list[int] = []
+    for index in range(required_bars - 1, len(archived)):
+        close_time = int(archived[index]["close_time"])
+        decision_time = close_time + 1
+        if decision_time < payload.start_ms or decision_time > payload.end_ms:
+            continue
+        window = archived[index - required_bars + 1 : index + 1]
+        if all(
+            int(right["open_time"]) - int(left["open_time"]) == interval_ms
+            for left, right in zip(window, window[1:])
+        ):
+            candidates.append(decision_time)
+    if not candidates:
+        raise HTTPException(
+            status_code=422,
+            detail="指定时间范围内没有足够长且连续的已归档 K 线窗口",
+        )
+
+    point_count = min(payload.points, len(candidates))
+    if point_count == 1:
+        decision_times = [candidates[-1]]
+    else:
+        indices = [
+            round(index * (len(candidates) - 1) / (point_count - 1))
+            for index in range(point_count)
+        ]
+        decision_times = list(dict.fromkeys(candidates[index] for index in indices))
+
+    items = [
+        {
+            "market": payload.market,
+            "exchange": payload.exchange,
+            "symbol": symbol,
+            "timeframe": payload.timeframe,
+            "analysis_bars": payload.analysis_bars,
+            "decision_time_ms": decision_time,
+        }
+        for decision_time in decision_times
+    ]
+    owner = _owner(request)
+    job = request.app.state.replay_jobs.create(owner, items)
+    task = asyncio.create_task(
+        _run_historical_replay(request.app, job["job_id"], owner, items, job["created_at"])
+    )
+    request.app.state.replay_tasks.add(task)
+    task.add_done_callback(request.app.state.replay_tasks.discard)
+    return {
+        **job,
+        "candidate_count": len(candidates),
+        "selected_points": len(decision_times),
+        "note": "回放时点取自归档 K 线收盘边界；只使用决策时点已收盘 K 线和当时已可用的衍生品记录。",
+    }
+
+
+async def _run_historical_replay(
+    app: Any,
+    job_id: str,
+    owner: str,
+    items: list[dict[str, Any]],
+    created_at: str,
+) -> None:
+    jobs = app.state.replay_jobs
+    jobs.set_running(job_id)
+    async with app.state.replay_semaphore:
+        for index, item in enumerate(items, start=1):
+            jobs.set_current(job_id, item, index)
+            analysis_id = f"replay-{job_id}-{item['decision_time_ms']}"
+            trace_events: list[dict[str, Any]] = []
+            request_data = {
+                **item,
+                "historical_replay": True,
+                "replay_job_id": job_id,
+            }
+            try:
+                async with app.state.analysis_semaphore:
+                    run = await app.state.analysis_service.analyze_historical(
+                        item["market"],
+                        item["symbol"],
+                        item["timeframe"],
+                        item["analysis_bars"],
+                        item["exchange"],
+                        item["decision_time_ms"],
+                        on_trace=trace_events.append,
+                    )
+                result = {
+                    "analysis_id": analysis_id,
+                    "status": "failed" if run.record.exception else "completed",
+                    "market": item["market"],
+                    "exchange": item["exchange"],
+                    "symbol": item["symbol"],
+                    "timeframe": item["timeframe"],
+                    "decision_time_ms": item["decision_time_ms"],
+                    "bar_count": run.record.meta.bar_count,
+                    "events": run.events,
+                    "stage1_diagnosis": run.record.stage1_diagnosis,
+                    "stage2_decision": run.record.stage2_decision,
+                    "usage": run.record.usage_total,
+                    "error": run.record.exception,
+                    "trace": run.trace,
+                    "details": run.details,
+                    "historical_replay": True,
+                }
+                await asyncio.to_thread(
+                    app.state.history_store.save_analysis,
+                    analysis_id=analysis_id,
+                    owner=owner,
+                    request_data=request_data,
+                    status=result["status"],
+                    result=result,
+                    trace=run.trace,
+                    details=run.details,
+                    created_at=created_at,
+                )
+                jobs.complete_item(
+                    job_id,
+                    {
+                        "status": result["status"],
+                        "analysis_id": analysis_id,
+                        "decision_time_ms": item["decision_time_ms"],
+                        "stage1_diagnosis": run.record.stage1_diagnosis,
+                        "stage2_decision": run.record.stage2_decision,
+                        "usage": run.record.usage_total,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc)[:400]
+                await asyncio.to_thread(
+                    app.state.history_store.save_analysis,
+                    analysis_id=analysis_id,
+                    owner=owner,
+                    request_data=request_data,
+                    status="failed",
+                    result={
+                        "analysis_id": analysis_id,
+                        "status": "failed",
+                        "error": {"message": message},
+                        "historical_replay": True,
+                    },
+                    trace=trace_events,
+                    details={},
+                    created_at=created_at,
+                )
+                jobs.complete_item(
+                    job_id,
+                    {
+                        "status": "failed",
+                        "analysis_id": analysis_id,
+                        "decision_time_ms": item["decision_time_ms"],
+                        "error": message,
+                    },
+                )
+    jobs.finish(job_id)
+
+
+@router.get("/history/replay/{job_id}")
+async def get_historical_replay(job_id: str, request: Request):
+    job = request.app.state.replay_jobs.get(job_id, _owner(request))
+    if job is None:
+        raise HTTPException(status_code=404, detail="历史回放任务不存在或已过期")
     return job
 
 

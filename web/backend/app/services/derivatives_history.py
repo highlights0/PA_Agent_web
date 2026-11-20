@@ -465,6 +465,18 @@ async def collect_derivatives_history(
             observations.extend(metric_observations)
             metrics[metric] = summary
 
+    has_records = any(item.get("records", 0) for item in metrics.values())
+    has_unavailable = any(item.get("status") == "unavailable" for item in metrics.values())
+    has_limited_window = any(item.get("status") == "window_limited" for item in metrics.values())
+    if has_records and (has_unavailable or has_limited_window):
+        run_status = "partial"
+    elif has_records:
+        run_status = "completed"
+    elif has_unavailable:
+        run_status = "unavailable"
+    else:
+        run_status = "no_data"
+
     return {
         "run_id": str(uuid.uuid4()),
         "market": "usdm",
@@ -474,11 +486,7 @@ async def collect_derivatives_history(
         "start_time_ms": start_ms,
         "end_time_ms": end_ms,
         "fetched_at_ms": fetched_at_ms,
-        "status": (
-            "completed"
-            if any(item.get("records", 0) for item in metrics.values())
-            else "no_data"
-        ),
+        "status": run_status,
         "metrics": metrics,
         "observations": observations,
         "observation_count": len(observations),

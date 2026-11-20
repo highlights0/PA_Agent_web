@@ -98,3 +98,47 @@ def test_market_candle_archive_can_resume_from_oldest_saved_timestamp(tmp_path: 
     assert coverage["candle_count"] == 2
     assert coverage["oldest_open_time_ms"] == 900_000
     assert coverage["newest_open_time_ms"] == 1_800_000
+
+
+
+def test_similar_segments_excludes_samples_whose_future_label_overlaps_now(tmp_path: Path):
+    store = AnalysisHistoryStore(tmp_path / "history.sqlite3")
+    base = {
+        "market": "usdm",
+        "exchange": "gate",
+        "symbol": "BTCUSDT",
+        "timeframe": "15m",
+        "regime": "range",
+        "segment_start_ms": 100,
+        "lookback_bars": 24,
+        "horizon_bars": 12,
+        "feature_schema_version": "pa-segment-features-v1",
+        "label_schema_version": "forward-outcome-v1",
+        "features": {"net_return_pct": 0.2},
+    }
+    store.upsert_segments([
+        {
+            **base,
+            "sample_id": "fully-observed",
+            "decision_time_ms": 200,
+            "labels": {"forward_direction": "up", "future_end_ms": 800},
+        },
+        {
+            **base,
+            "sample_id": "future-overlap",
+            "decision_time_ms": 400,
+            "labels": {"forward_direction": "down", "future_end_ms": 1200},
+        },
+    ])
+
+    result = store.similar_segments(
+        market="usdm",
+        exchange="gate",
+        symbol="BTCUSDT",
+        timeframe="15m",
+        features={"regime": "range", "features": {"net_return_pct": 0.2}},
+        before_ms=1000,
+        limit=5,
+    )
+
+    assert [item["sample_id"] for item in result] == ["fully-observed"]

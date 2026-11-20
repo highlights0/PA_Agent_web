@@ -1,8 +1,9 @@
 """Persistent analysis/search history and leakage-safe PA dataset endpoints."""
 from __future__ import annotations
 
+import asyncio
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -155,15 +156,41 @@ async def build_historical_dataset(payload: DatasetBuildInput, request: Request)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"获取历史 K 线失败：{str(exc)[:240]}") from exc
 
-    samples = build_segment_samples(
-        bars,
+    history = _history(request)
+    stored_candles = await asyncio.to_thread(
+        history.upsert_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        candles=bars,
+    )
+    archived = await asyncio.to_thread(
+        history.list_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        limit=50000,
+    )
+    samples = await asyncio.to_thread(
+        build_segment_samples,
+        archived,
         market=payload.market,
         exchange=payload.exchange,
         symbol=symbol,
         timeframe=payload.timeframe,
     )
-    stored = _history(request).upsert_segments(samples)
-    stats = _history(request).dataset_stats(
+    stored = await asyncio.to_thread(history.upsert_segments, samples)
+    stats = await asyncio.to_thread(
+        history.dataset_stats,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+    )
+    coverage = await asyncio.to_thread(
+        history.market_candle_coverage,
         market=payload.market,
         exchange=payload.exchange,
         symbol=symbol,
@@ -173,11 +200,12 @@ async def build_historical_dataset(payload: DatasetBuildInput, request: Request)
         "requested_bars": limit,
         "received_bars": len(bars),
         "closed_bars": sum(1 for bar in bars if bar.closed),
+        "stored_candles": stored_candles,
+        "archive_candles": coverage["candle_count"],
         "new_samples": stored,
         "dataset": stats,
-        "note": "历史样本按已收盘 K 线构建；未来标签仅存入 labels，不进入 features 或 AI Prompt。",
+        "note": "已收盘 K 线已归档；样本从完整归档重建。未来标签只用于事后评估，不进入特征或 AI Prompt。",
     }
-
 
 
 class BackfillInput(BaseModel):
@@ -189,50 +217,278 @@ class BackfillInput(BaseModel):
     bars: int = Field(default=3000, ge=80, le=12000)
 
 
+class BatchBackfillInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    jobs: list[BackfillInput] = Field(min_length=1, max_length=24)
+
+
 @router.post("/history/dataset/backfill")
 async def backfill_history(payload: BackfillInput, request: Request):
-    """Backfill a bounded time range from the explicitly selected exchange."""
+    """Resume a bounded backfill from the oldest archived candle."""
     symbol = _symbol(payload.symbol)
-    try:
-        response = await backfill_market_candles(
-            request.app.state.market_service,
-            market=payload.market,
-            exchange=payload.exchange,
-            symbol=symbol,
-            timeframe=payload.timeframe,
-            requested_bars=payload.bars,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=f"历史回补参数不受支持：{str(exc)[:240]}") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"历史 K 线回补失败：{str(exc)[:240]}") from exc
-
-    samples = build_segment_samples(
-        response["bars"],
+    history = _history(request)
+    coverage = await asyncio.to_thread(
+        history.market_candle_coverage,
         market=payload.market,
         exchange=payload.exchange,
         symbol=symbol,
         timeframe=payload.timeframe,
     )
-    new_samples = _history(request).upsert_segments(samples)
+    existing_count = int(coverage["candle_count"])
+    remaining = max(0, payload.bars - existing_count)
+    response = {
+        "bars": [],
+        "pages": 0,
+        "gaps": 0,
+        "closed_bars": 0,
+        "source": payload.exchange,
+        "truncated": False,
+    }
+    if remaining:
+        try:
+            response = await backfill_market_candles(
+                request.app.state.market_service,
+                market=payload.market,
+                exchange=payload.exchange,
+                symbol=symbol,
+                timeframe=payload.timeframe,
+                requested_bars=max(80, remaining),
+                before_open_time_ms=coverage["oldest_open_time_ms"],
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"历史回补参数不受支持：{str(exc)[:240]}") from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"历史 K 线回补失败：{str(exc)[:240]}") from exc
+
+    stored_candles = await asyncio.to_thread(
+        history.upsert_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        candles=response["bars"],
+    )
+    archived = await asyncio.to_thread(
+        history.list_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        limit=50000,
+    )
+    samples = await asyncio.to_thread(
+        build_segment_samples,
+        archived,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+    )
+    new_samples = await asyncio.to_thread(history.upsert_segments, samples)
+    coverage_after = await asyncio.to_thread(
+        history.market_candle_coverage,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+    )
     return {
         "requested_bars": payload.bars,
         "received_bars": response["closed_bars"],
+        "stored_candles": stored_candles,
+        "archive_candles": coverage_after["candle_count"],
         "pages": response["pages"],
         "gaps": response["gaps"],
-        "truncated": response["truncated"],
+        "truncated": response["truncated"] or coverage_after["candle_count"] < payload.bars,
         "new_samples": new_samples,
-        "dataset": _history(request).dataset_stats(
+        "dataset": await asyncio.to_thread(
+            history.dataset_stats,
             market=payload.market,
             exchange=payload.exchange,
             symbol=symbol,
             timeframe=payload.timeframe,
         ),
         "note": (
-            f"{payload.exchange} 历史 K 线分页回补完成；"
-            "缺失 K 线会保留为时间缺口，样本生成不会跨缺口构造未来标签。"
-            "回补数据仅用于样本与评估，不自动修改 AI 决策。"
+            f"{payload.exchange} 历史 K 线归档已更新；"
+            "重复执行会从最早已归档时间继续向前补齐，重复 K 线按唯一键去重。"
+            "缺失 K  线保留为时间缺口，样本生成不会跨缺口构造未来标签。"
         ),
+    }
+
+
+async def _backfill_one_item(app: Any, payload: BackfillInput) -> dict[str, Any]:
+    history = app.state.history_store
+    symbol = _symbol(payload.symbol)
+    coverage = await asyncio.to_thread(
+        history.market_candle_coverage,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+    )
+    existing_count = int(coverage["candle_count"])
+    remaining = max(0, payload.bars - existing_count)
+    response = {
+        "bars": [],
+        "pages": 0,
+        "gaps": 0,
+        "closed_bars": 0,
+        "source": payload.exchange,
+        "truncated": False,
+    }
+    if remaining:
+        response = await backfill_market_candles(
+            app.state.market_service,
+            market=payload.market,
+            exchange=payload.exchange,
+            symbol=symbol,
+            timeframe=payload.timeframe,
+            requested_bars=max(80, remaining),
+            before_open_time_ms=coverage["oldest_open_time_ms"],
+        )
+    stored_candles = await asyncio.to_thread(
+        history.upsert_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        candles=response["bars"],
+    )
+    archived = await asyncio.to_thread(
+        history.list_market_candles,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+        limit=50000,
+    )
+    samples = await asyncio.to_thread(
+        build_segment_samples,
+        archived,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+    )
+    new_samples = await asyncio.to_thread(history.upsert_segments, samples)
+    coverage_after = await asyncio.to_thread(
+        history.market_candle_coverage,
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
+    )
+    return {
+        "status": "completed",
+        "market": payload.market,
+        "exchange": payload.exchange,
+        "symbol": symbol,
+        "timeframe": payload.timeframe,
+        "requested_bars": payload.bars,
+        "received_bars": response["closed_bars"],
+        "stored_candles": stored_candles,
+        "archive_candles": coverage_after["candle_count"],
+        "pages": response["pages"],
+        "gaps": response["gaps"],
+        "truncated": response["truncated"] or coverage_after["candle_count"] < payload.bars,
+        "new_samples": new_samples,
+    }
+
+
+async def _run_batch_backfill(app: Any, job_id: str, owner: str, jobs: list[dict[str, Any]]) -> None:
+    job_store = app.state.backfill_jobs
+    job_store.set_running(job_id)
+    async with app.state.backfill_semaphore:
+        for index, item in enumerate(jobs, start=1):
+            job_store.set_current(job_id, item, index)
+            try:
+                result = await _backfill_one_item(app, BackfillInput(**item))
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "status": "failed",
+                    **item,
+                    "error": str(exc)[:300],
+                }
+            job_store.complete_item(job_id, result)
+    job_store.finish(job_id)
+
+
+@router.post("/history/dataset/batch-backfill", status_code=202)
+async def start_batch_backfill(payload: BatchBackfillInput, request: Request):
+    items = [item.model_dump() for item in payload.jobs]
+    keys = [
+        (item["market"], item["exchange"], _symbol(item["symbol"]), item["timeframe"])
+        for item in items
+    ]
+    if len(set(keys)) != len(keys):
+        raise HTTPException(status_code=422, detail="批量任务中存在重复的交易对与周期组合")
+    if sum(item["bars"] for item in items) > 60000:
+        raise HTTPException(status_code=422, detail="单批回补总量不能超过 60000 根 K 线")
+    for item in items:
+        try:
+            request.app.state.market_service._provider(item["market"], item["exchange"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    owner = _owner(request)
+    job = request.app.state.backfill_jobs.create(owner, items)
+    task = asyncio.create_task(
+        _run_batch_backfill(request.app, job["job_id"], owner, items)
+    )
+    request.app.state.backfill_tasks.add(task)
+    task.add_done_callback(request.app.state.backfill_tasks.discard)
+    return job
+
+
+@router.get("/history/dataset/batch-backfill/{job_id}")
+async def get_batch_backfill(job_id: str, request: Request):
+    job = request.app.state.backfill_jobs.get(job_id, _owner(request))
+    if job is None:
+        raise HTTPException(status_code=404, detail="批量回补任务不存在或已过期")
+    return job
+
+
+@router.get("/history/candles/stats")
+async def get_market_candle_stats(
+    request: Request,
+    market: str | None = None,
+    exchange: str | None = None,
+    symbol: str | None = None,
+    timeframe: str | None = None,
+):
+    return {
+        "items": await asyncio.to_thread(
+            _history(request).market_candle_stats,
+            market=market,
+            exchange=exchange,
+            symbol=_symbol(symbol) if symbol else None,
+            timeframe=timeframe,
+        )
+    }
+
+
+@router.get("/history/candles")
+async def list_market_candles(
+    request: Request,
+    market: Literal["spot", "usdm"],
+    exchange: Literal["binance", "binance_us", "coinbase", "gate"],
+    symbol: str,
+    timeframe: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    limit: int = Query(default=500, ge=1, le=5000),
+):
+    return {
+        "items": await asyncio.to_thread(
+            _history(request).list_market_candles,
+            market=market,
+            exchange=exchange,
+            symbol=_symbol(symbol),
+            timeframe=timeframe,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=limit,
+        )
     }
 
 

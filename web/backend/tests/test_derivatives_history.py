@@ -144,6 +144,7 @@ def test_binance_one_month_limit_is_reported_without_fabricating_older_oi():
         )
     )
 
+    assert result["status"] == "partial"
     assert result["metrics"]["funding_rate"]["status"] == "ok"
     assert result["metrics"]["open_interest"]["status"] == "window_limited"
     assert result["metrics"]["open_interest"]["effective_start_ms"] > start

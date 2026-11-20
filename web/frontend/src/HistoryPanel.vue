@@ -498,6 +498,82 @@ onMounted(() => void refreshHistory());
               {{ backfilling ? "历史分页回补中…" : "历史分页回补" }}
             </button>
           </div>
+          <section class="history-subsection">
+            <h3>批量历史采集与断点续传</h3>
+            <p>按当前交易所和市场批量采集多个交易对与周期。已归档的 K 线会去重，重复启动时从最早已归档时间继续向前补齐。</p>
+            <label class="ai-field">
+              <span>交易对（逗号分隔）</span>
+              <input
+                v-model="batchSymbolsInput"
+                :placeholder="defaultBatchSymbols"
+                :disabled="batching"
+              />
+            </label>
+            <div class="history-dataset-actions">
+              <label
+                v-for="period in batchTimeframeOptions"
+                :key="period"
+                class="history-compare-check"
+              >
+                <input
+                  v-model="batchTimeframes"
+                  type="checkbox"
+                  :value="period"
+                  :disabled="batching"
+                />
+                <span>{{ period }}</span>
+              </label>
+            </div>
+            <div class="history-dataset-actions">
+              <label class="history-backfill-count">
+                <span>每个组合目标 K 线数</span>
+                <select v-model.number="batchBars" :disabled="batching">
+                  <option :value="1000">1000 根</option>
+                  <option :value="3000">3000 根</option>
+                  <option :value="6000">6000 根</option>
+                  <option :value="12000">12000 根</option>
+                </select>
+              </label>
+              <button class="primary-button" :disabled="batching" @click="startBatchBackfill">
+                {{ batching ? "批量采集中…" : "开始批量采集" }}
+              </button>
+            </div>
+            <p class="history-dataset-note">默认交易对：{{ defaultBatchSymbols }}。单批最多 24 个组合、总目标不超过 60000 根；任务按顺序执行，避免同时冲击交易所接口。</p>
+            <div v-if="batchJob" class="history-subsection">
+              <div class="history-section-heading">
+                <strong>任务进度</strong>
+                <span>{{ batchJob.completed }} / {{ batchJob.total }} · {{ batchProgress }}%</span>
+              </div>
+              <progress :value="batchJob.completed" :max="batchJob.total" style="width: 100%" />
+              <p v-if="batchJob.current">
+                当前：{{ batchJob.current.symbol }} · {{ batchJob.current.timeframe }}（第 {{ batchJob.current.index }} 项）
+              </p>
+              <p v-else>任务状态：{{ batchJob.status === "completed" ? "已完成" : batchJob.status === "failed" ? "失败" : "排队中" }}</p>
+              <article
+                v-for="item in batchJob.results"
+                :key="item.market + item.exchange + item.symbol + item.timeframe"
+                class="history-sample-item"
+              >
+                <div>
+                  <strong>{{ item.symbol }} · {{ item.timeframe }}</strong>
+                  <span>{{ item.status === "completed" ? "完成" : "失败" }}</span>
+                </div>
+                <p v-if="item.status === 'completed'">
+                  归档 {{ item.archive_candles }} 根 · 本次新增 {{ item.stored_candles }} 根 · 样本新增 {{ item.new_samples }} 个
+                </p>
+                <p v-else>{{ item.error }}</p>
+              </article>
+            </div>
+          </section>
+          <section v-if="candleArchive" class="history-subsection">
+            <h3>原始 K 线归档</h3>
+            <div class="history-dataset-metrics">
+              <div><small>已归档 K 线</small><strong>{{ candleArchive.candle_count }}</strong></div>
+              <div><small>最早时间</small><strong>{{ formatTime(candleArchive.oldest_open_time_ms) }}</strong></div>
+              <div><small>最新时间</small><strong>{{ formatTime(candleArchive.newest_open_time_ms) }}</strong></div>
+            </div>
+            <p class="history-dataset-note">原始 OHLCV 与交易所来源独立保存，可用于后续历史回放；只归档已收盘 K 线。</p>
+          </section>
           <div class="history-dataset-actions">
             <button class="secondary-button" :disabled="evaluating" @click="evaluateBaseline">
               {{ evaluating ? "评估中…" : "评估固定规则基线" }}

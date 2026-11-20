@@ -423,11 +423,16 @@ class AnalysisService:
         # The shared system prompt is process-cached; include its declared source
         # files and the fixed Stage 1 / Stage 2 task files even on cache hits.
         for constant_name in (
-            "COMMON_SYSTEM_PROMPT_TXT_FILES",
+            "COMMON_SYSTEM_STAGE1_TXT_FILES",
             "STAGE1_TASK_PROMPT_TXT_FILES",
-            "STAGE2_BASE_PROMPT_TXT_FILES",
         ):
             prompt_files.update(getattr(prompt_module, constant_name, ()) or ())
+        # Stage 2 task files are only part of this run if the orchestrator
+        # actually built Stage 2 messages (a wait/unknown gate can short-circuit it).
+        if getattr(record, "stage2_messages", None):
+            prompt_files.update(
+                getattr(prompt_module, "STAGE2_BASE_PROMPT_TXT_FILES", ()) or ()
+            )
         prompt_files.update(record.strategy_files_used or [])
         project_root = prompt_dir.parent
         def file_digest(path: Path) -> dict[str, Any]:

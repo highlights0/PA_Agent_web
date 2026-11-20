@@ -12,6 +12,8 @@ import {
   type DatasetStats,
   type BatchBackfillJob,
   type MarketCandleArchiveStats,
+  type DerivativesCollectionReport,
+  type DerivativesArchiveStats,
 } from "./api";
 
 const props = defineProps<{
@@ -37,6 +39,12 @@ const stats = ref<DatasetStats | null>(null);
 const samples = ref<SegmentSample[]>([]);
 const similar = ref<SegmentSample[]>([]);
 const candleArchive = ref<MarketCandleArchiveStats | null>(null);
+const derivativesStart = ref("");
+const derivativesEnd = ref("");
+const derivativesPeriod = ref("15m");
+const derivativesReport = ref<DerivativesCollectionReport | null>(null);
+const derivativesArchive = ref<DerivativesArchiveStats[]>([]);
+const derivativesBusy = ref(false);
 const batchSymbolsInput = ref("");
 const batchTimeframes = ref<string[]>(props.exchange === "coinbase" ? ["15m", "1h", "6h"] : ["15m", "1h", "4h"]);
 const batchBars = ref(3000);
@@ -64,6 +72,15 @@ const datasetQuery = computed(() => ({
   timeframe: props.timeframe,
 }));
 
+const derivativesPeriodOptions = computed(() =>
+  props.exchange === "gate"
+    ? ["5m", "15m", "30m", "1h", "4h", "8h", "1d"]
+    : ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"],
+);
+const derivativesMetricEntries = computed(() =>
+  Object.entries(derivativesReport.value?.metrics ?? {}),
+);
+
 const batchTimeframeOptions = computed(() => {
   if (props.exchange === "coinbase") return ["1m", "5m", "15m", "1h", "6h", "1d"];
   if (props.exchange === "gate") return ["1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"];
@@ -88,6 +105,10 @@ watch(
       ? ["15m", "1h", "6h"]
       : ["15m", "1h", "4h"];
     batchJob.value = null;
+    derivativesPeriod.value = props.exchange === "gate" ? "15m" : "15m";
+    derivativesReport.value = null;
+    derivativesArchive.value = [];
+    void refreshDerivativesArchive();
   },
 );
 
@@ -242,6 +263,67 @@ async function backfillHistory() {
   }
 }
 
+function toLocalDateTimeInput(date: Date) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function initializeDerivativesDateRange() {
+  const now = new Date();
+  derivativesEnd.value = toLocalDateTimeInput(now);
+  derivativesStart.value = toLocalDateTimeInput(new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000));
+}
+
+async function refreshDerivativesArchive() {
+  if (props.market !== "usdm" || !["binance", "gate"].includes(props.exchange)) {
+    derivativesArchive.value = [];
+    return;
+  }
+  try {
+    const result = await api.derivativesStats({
+      market: "usdm",
+      exchange: props.exchange,
+      symbol: props.symbol,
+    });
+    derivativesArchive.value = result.items;
+  } catch {
+    derivativesArchive.value = [];
+  }
+}
+
+async function backfillDerivativesHistory() {
+  if (props.market !== "usdm" || !["binance", "gate"].includes(props.exchange)) return;
+  const startMs = new Date(derivativesStart.value).getTime();
+  const endMs = new Date(derivativesEnd.value).getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) {
+    error.value = "请检查衍生品历史采集的起止时间。";
+    return;
+  }
+  derivativesBusy.value = true;
+  error.value = "";
+  derivativesReport.value = null;
+  try {
+    derivativesReport.value = await api.backfillDerivatives({
+      market: "usdm",
+      exchange: props.exchange,
+      symbol: props.symbol,
+      period: derivativesPeriod.value,
+      start_ms: startMs,
+      end_ms: endMs,
+    });
+    await refreshDerivativesArchive();
+    const unavailable = Object.entries(derivativesReport.value.metrics)
+      .filter(([, item]) => item.status === "unavailable")
+      .length;
+    notice.value = `衍生品历史采集完成：写入 ${derivativesReport.value.stored_observations} 条观测记录。` +
+      (unavailable ? `其中 ${unavailable} 项接口不可用，请检查指标状态。` : "");
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : "衍生品历史采集失败";
+  } finally {
+    derivativesBusy.value = false;
+  }
+}
+
 async function pollBatchBackfill(jobId: string) {
   try {
     const job = await api.getBatchBackfill(jobId);
@@ -335,7 +417,11 @@ async function loadSimilar() {
   }
 }
 
-onMounted(() => void refreshHistory());
+onMounted(() => {
+  initializeDerivativesDateRange();
+  void refreshHistory();
+  void refreshDerivativesArchive();
+});
 </script>
 
 <template>
@@ -573,6 +659,51 @@ onMounted(() => void refreshHistory());
               <div><small>最新时间</small><strong>{{ formatTime(candleArchive.newest_open_time_ms) }}</strong></div>
             </div>
             <p class="history-dataset-note">原始 OHLCV 与交易所来源独立保存，可用于后续历史回放；只归档已收盘 K 线。</p>
+          </section>
+          <section v-if="market === 'usdm' && (exchange === 'binance' || exchange === 'gate')" class="history-subsection">
+            <h3>合约衍生品历史数据</h3>
+            <p>采集资金费率、OI、多空比、Taker 比例及可用的爆仓统计。历史数据与实时快照分开保存，不会用实时快照填补历史缺失。</p>
+            <div class="history-dataset-actions">
+              <label class="ai-field">
+                <span>统计周期</span>
+                <select v-model="derivativesPeriod" :disabled="derivativesBusy">
+                  <option v-for="period in derivativesPeriodOptions" :key="period" :value="period">{{ period }}</option>
+                </select>
+              </label>
+              <label class="ai-field">
+                <span>开始时间（本地时区）</span>
+                <input v-model="derivativesStart" type="datetime-local" :disabled="derivativesBusy" />
+              </label>
+              <label class="ai-field">
+                <span>结束时间（本地时区）</span>
+                <input v-model="derivativesEnd" type="datetime-local" :disabled="derivativesBusy" />
+              </label>
+              <button class="primary-button" :disabled="derivativesBusy" @click="backfillDerivativesHistory">
+                {{ derivativesBusy ? "采集中…" : "采集衍生品历史" }}
+              </button>
+            </div>
+            <p class="history-dataset-note">
+              Binance 的 OI、多空比、Taker 和大户统计历史接口通常只提供最近约 30 天；资金费率历史范围更长。Gate 统计按接口支持的时间范围分页。接口没有返回的数据会标记为无记录或不可用。
+            </p>
+            <div v-if="derivativesReport" class="history-subsection">
+              <h4>本次采集结果 · {{ derivativesReport.observation_count }} 条</h4>
+              <div class="history-distributions">
+                <div v-for="[metric, result] in derivativesMetricEntries" :key="metric">
+                  <strong>{{ metric }}</strong>
+                  <span>{{ result.status }} · {{ result.records }} 条</span>
+                  <small v-if="result.effective_start_ms">可查询起点：{{ formatTime(result.effective_start_ms) }}</small>
+                  <small v-if="result.error">{{ result.error }}</small>
+                </div>
+              </div>
+              <p class="history-dataset-note">{{ derivativesReport.note }}</p>
+            </div>
+            <div v-if="derivativesArchive.length" class="history-subsection">
+              <h4>已归档指标</h4>
+              <article v-for="item in derivativesArchive" :key="item.metric + item.period + item.data_kind" class="history-sample-item">
+                <div><strong>{{ item.metric }} · {{ item.period || "事件数据" }}</strong><span>{{ item.data_kind }}</span></div>
+                <p>{{ item.record_count }} 条 · {{ formatTime(item.oldest_event_time_ms) }} 至 {{ formatTime(item.newest_event_time_ms) }}</p>
+              </article>
+            </div>
           </section>
           <div class="history-dataset-actions">
             <button class="secondary-button" :disabled="evaluating" @click="evaluateBaseline">

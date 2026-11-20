@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.api.v1.ai_settings import _authorize
 from app.services.historical_backfill import backfill_market_candles
 from app.services.derivatives_history import collect_derivatives_history
-from app.services.historical_replay import context_period
+from app.services.historical_replay import select_replay_decision_times
 from app.services.baseline_evaluation import evaluate_rule_baseline
 from app.services.segmenter import build_current_features, build_segment_samples
 
@@ -474,17 +474,6 @@ async def get_batch_backfill(job_id: str, request: Request):
     return job
 
 
-def _replay_interval_ms(timeframe: str) -> int | None:
-    return {
-        "1m": 60_000, "3m": 180_000, "5m": 300_000,
-        "15m": 900_000, "30m": 1_800_000,
-        "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000,
-        "6h": 21_600_000, "8h": 28_800_000, "12h": 43_200_000,
-        "1d": 86_400_000, "3d": 259_200_000,
-        "1w": 604_800_000, "7d": 604_800_000,
-    }.get(timeframe)
-
-
 @router.post("/history/replay", status_code=202)
 async def start_historical_replay(payload: HistoricalReplayInput, request: Request):
     symbol = _symbol(payload.symbol)
@@ -492,9 +481,8 @@ async def start_historical_replay(payload: HistoricalReplayInput, request: Reque
         raise HTTPException(status_code=422, detail="USDT 永续历史回放仅支持 Binance 和 Gate")
     if payload.market == "spot" and payload.exchange == "gate":
         raise HTTPException(status_code=422, detail="Gate 现货历史回放暂不支持")
-    interval_ms = _replay_interval_ms(payload.timeframe)
-    if interval_ms is None:
-        raise HTTPException(status_code=422, detail="当前周期暂不支持历史回放")
+    if payload.timeframe == "1M":
+        raise HTTPException(status_code=422, detail="月线周期暂不支持历史回放")
     if payload.end_ms < payload.start_ms:
         raise HTTPException(status_code=422, detail="结束时间不能早于开始时间")
     now_ms = int(time.time() * 1000)
@@ -521,33 +509,22 @@ async def start_historical_replay(payload: HistoricalReplayInput, request: Reque
             detail=f"归档只有 {len(archived)} 根 K 线，至少需要 {required_bars} 根",
         )
 
-    candidates: list[int] = []
-    for index in range(required_bars - 1, len(archived)):
-        close_time = int(archived[index]["close_time"])
-        decision_time = close_time + 1
-        if decision_time < payload.start_ms or decision_time > payload.end_ms:
-            continue
-        window = archived[index - required_bars + 1 : index + 1]
-        if all(
-            int(right["open_time"]) - int(left["open_time"]) == interval_ms
-            for left, right in zip(window, window[1:])
-        ):
-            candidates.append(decision_time)
-    if not candidates:
+    try:
+        decision_times, candidate_count = select_replay_decision_times(
+            archived,
+            timeframe=payload.timeframe,
+            start_ms=payload.start_ms,
+            end_ms=payload.end_ms,
+            required_bars=required_bars,
+            points=payload.points,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not decision_times:
         raise HTTPException(
             status_code=422,
             detail="指定时间范围内没有足够长且连续的已归档 K 线窗口",
         )
-
-    point_count = min(payload.points, len(candidates))
-    if point_count == 1:
-        decision_times = [candidates[-1]]
-    else:
-        indices = [
-            round(index * (len(candidates) - 1) / (point_count - 1))
-            for index in range(point_count)
-        ]
-        decision_times = list(dict.fromkeys(candidates[index] for index in indices))
 
     items = [
         {
@@ -569,7 +546,7 @@ async def start_historical_replay(payload: HistoricalReplayInput, request: Reque
     task.add_done_callback(request.app.state.replay_tasks.discard)
     return {
         **job,
-        "candidate_count": len(candidates),
+        "candidate_count": candidate_count,
         "selected_points": len(decision_times),
         "note": "回放时点取自归档 K 线收盘边界；只使用决策时点已收盘 K 线和当时已可用的衍生品记录。",
     }

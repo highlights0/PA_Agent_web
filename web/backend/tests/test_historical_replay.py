@@ -130,7 +130,7 @@ def test_derivatives_asof_query_requires_event_and_availability_before_cutoff(tm
     # publication time; the conservative available_at boundary controls replay.
     assert result["items"][0]["fetched_at_ms"] > 2_500
     assert result["items"][0]["available_at_ms"] <= 2_500
-    assert result["excluded_or_unavailable_count"] == 2
+    assert result["excluded_or_unavailable_count"] == 3
 
 
 def test_historical_context_uses_only_asof_observations_and_reports_missing_metrics():

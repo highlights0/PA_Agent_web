@@ -236,84 +236,94 @@ async def _collect_binance_metric(
     }
 
 
-async def _collect_gate_metric(
+async def _collect_gate_history(
     provider: Any,
     *,
     symbol: str,
-    metric: str,
     period: str,
     start_ms: int,
     end_ms: int,
     fetched_at_ms: int,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Fetch Gate funding and contract statistics once per page, then fan out metrics."""
     start_s = start_ms // 1000
     end_s = end_ms // 1000
     observations: list[dict[str, Any]] = []
-    pages = 0
-    if metric == "funding_rate":
-        endpoint = "/futures/usdt/funding_rate"
-        cursor = start_s
-        while cursor <= end_s and pages < 1000:
-            rows = await provider.funding_rate_history_range(
-                symbol, from_s=cursor, to_s=end_s, limit=100
+    summaries: dict[str, dict[str, Any]] = {}
+    funding_endpoint = "/futures/usdt/funding_rate"
+    funding_cursor = start_s
+    funding_pages = 0
+    funding_count = 0
+    while funding_cursor <= end_s and funding_pages < 1000:
+        rows = await provider.funding_rate_history_range(
+            symbol, from_s=funding_cursor, to_s=end_s, limit=100
+        )
+        funding_pages += 1
+        if not isinstance(rows, list) or not rows:
+            break
+        parsed = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=lambda row: int(row.get("t", 0)),
+        )
+        latest_event = funding_cursor - 1
+        for row in parsed:
+            event_s = int(row.get("t", 0))
+            event_ms = event_s * 1000
+            if event_ms < start_ms or event_ms > end_ms:
+                continue
+            latest_event = max(latest_event, event_s)
+            observations.append(
+                {
+                    "market": "usdm",
+                    "exchange": "gate",
+                    "symbol": symbol,
+                    "metric": "funding_rate",
+                    "period": "",
+                    "event_time_ms": event_ms,
+                    "fetched_at_ms": fetched_at_ms,
+                    "data_kind": "historical",
+                    "value": {"funding_rate": row.get("r")},
+                    "raw": row,
+                    "source_endpoint": funding_endpoint,
+                    "quality": "ok" if row.get("r") is not None else "partial",
+                }
             )
-            pages += 1
-            if not isinstance(rows, list) or not rows:
-                break
-            parsed = sorted(
-                (row for row in rows if isinstance(row, dict)),
-                key=lambda row: int(row.get("t", 0)),
-            )
-            latest_event = cursor - 1
-            for row in parsed:
-                event_time = int(row.get("t", 0)) * 1000
-                if event_time < start_ms or event_time > end_ms:
-                    continue
-                latest_event = max(latest_event, event_time // 1000)
-                observations.append(
-                    {
-                        "market": "usdm",
-                        "exchange": "gate",
-                        "symbol": symbol,
-                        "metric": "funding_rate",
-                        "period": "",
-                        "event_time_ms": event_time,
-                        "fetched_at_ms": fetched_at_ms,
-                        "data_kind": "historical",
-                        "value": {"funding_rate": row.get("r")},
-                        "raw": row,
-                        "source_endpoint": endpoint,
-                        "quality": "ok" if row.get("r") is not None else "partial",
-                    }
-                )
-            if len(rows) < 100 or latest_event < cursor:
-                break
-            cursor = latest_event + 1
-            await asyncio.sleep(0.05)
-    else:
-        interval_seconds = _GATE_PERIOD_SECONDS[period]
-        endpoint = "/futures/usdt/contract_stats"
-        cursor = start_s
-        while cursor <= end_s and pages < 1000:
-            rows = await provider.contract_stats_range(
-                symbol, period, from_s=cursor, limit=200
-            )
-            pages += 1
-            if not isinstance(rows, list) or not rows:
-                break
-            parsed = sorted(
-                (row for row in rows if isinstance(row, dict)),
-                key=lambda row: int(row.get("time", 0)),
-            )
-            latest_event = cursor - 1
-            for row in parsed:
-                event_time = int(row.get("time", 0)) * 1000
-                if event_time < start_ms or event_time > end_ms:
-                    continue
-                latest_event = max(latest_event, event_time // 1000)
-                metrics = _gate_stat_metrics(row)
-                if metric not in metrics:
-                    continue
+            funding_count += 1
+        if len(rows) < 100 or latest_event < funding_cursor:
+            break
+        funding_cursor = latest_event + 1
+        await asyncio.sleep(0.05)
+    summaries["funding_rate"] = {
+        "status": "ok" if funding_count else "no_records",
+        "records": funding_count,
+        "pages": funding_pages,
+        "source_endpoint": funding_endpoint,
+    }
+
+    stats_endpoint = "/futures/usdt/contract_stats"
+    interval_seconds = _GATE_PERIOD_SECONDS[period]
+    stats_cursor = start_s
+    stats_pages = 0
+    metric_counts: dict[str, int] = {}
+    while stats_cursor <= end_s and stats_pages < 1000:
+        rows = await provider.contract_stats_range(
+            symbol, period, from_s=stats_cursor, limit=200
+        )
+        stats_pages += 1
+        if not isinstance(rows, list) or not rows:
+            break
+        parsed = sorted(
+            (row for row in rows if isinstance(row, dict)),
+            key=lambda row: int(row.get("time", 0)),
+        )
+        latest_event = stats_cursor - 1
+        for row in parsed:
+            event_s = int(row.get("time", 0))
+            event_ms = event_s * 1000
+            if event_ms < start_ms or event_ms > end_ms:
+                continue
+            latest_event = max(latest_event, event_s)
+            for metric, normalized in _gate_stat_metrics(row).items():
                 observations.append(
                     {
                         "market": "usdm",
@@ -321,26 +331,57 @@ async def _collect_gate_metric(
                         "symbol": symbol,
                         "metric": metric,
                         "period": period,
-                        "event_time_ms": event_time,
+                        "event_time_ms": event_ms,
                         "fetched_at_ms": fetched_at_ms,
                         "data_kind": "historical",
-                        "value": metrics[metric],
+                        "value": normalized,
                         "raw": row,
-                        "source_endpoint": endpoint,
+                        "source_endpoint": stats_endpoint,
                         "quality": "ok",
                     }
                 )
-            if len(rows) < 200 or latest_event < cursor:
-                break
-            cursor = latest_event + interval_seconds
-            await asyncio.sleep(0.05)
+                metric_counts[metric] = metric_counts.get(metric, 0) + 1
+        if len(rows) < 200 or latest_event < stats_cursor:
+            break
+        stats_cursor = latest_event + interval_seconds
+        await asyncio.sleep(0.05)
 
-    return observations, {
-        "status": "ok" if observations else "no_records",
-        "records": len(observations),
-        "pages": pages,
-        "source_endpoint": endpoint,
-    }
+    for metric, count in metric_counts.items():
+        summaries[metric] = {
+            "status": "ok" if count else "no_records",
+            "records": count,
+            "pages": stats_pages,
+            "source_endpoint": stats_endpoint,
+        }
+    for metric in (
+        "open_interest_contracts",
+        "open_interest_usd",
+        "global_long_short_ratio",
+        "taker_long_short_ratio",
+        "top_trader_long_short_account_ratio",
+        "top_trader_long_short_position_ratio",
+        "long_liquidation_contracts",
+        "short_liquidation_contracts",
+        "long_liquidation_usd",
+        "short_liquidation_usd",
+        "mark_price",
+        "long_users",
+        "short_users",
+        "top_long_size",
+        "top_short_size",
+        "long_taker_size",
+        "short_taker_size",
+    ):
+        summaries.setdefault(
+            metric,
+            {
+                "status": "no_records",
+                "records": 0,
+                "pages": stats_pages,
+                "source_endpoint": stats_endpoint,
+            },
+        )
+    return observations, summaries
 
 
 async def collect_derivatives_history(
@@ -393,53 +434,36 @@ async def collect_derivatives_history(
             return_exceptions=True,
         )
     else:
-        metric_names = [
-            "funding_rate",
-            "open_interest_contracts",
-            "open_interest_usd",
-            "global_long_short_ratio",
-            "taker_long_short_ratio",
-            "top_trader_long_short_account_ratio",
-            "top_trader_long_short_position_ratio",
-            "long_liquidation_contracts",
-            "short_liquidation_contracts",
-            "long_liquidation_usd",
-            "short_liquidation_usd",
-            "mark_price",
-            "long_users",
-            "short_users",
-            "top_long_size",
-            "top_short_size",
-            "long_taker_size",
-            "short_taker_size",
-        ]
-        results = await asyncio.gather(
-            *[
-                _collect_gate_metric(
-                    provider,
-                    symbol=symbol,
-                    metric=metric,
-                    period=period,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    fetched_at_ms=fetched_at_ms,
-                )
-                for metric in metric_names
-            ],
-            return_exceptions=True,
-        )
-
-    for metric, result in zip(metric_names, results, strict=True):
-        if isinstance(result, BaseException):
-            metrics[metric] = {
+        try:
+            gate_observations, gate_metrics = await _collect_gate_history(
+                provider,
+                symbol=symbol,
+                period=period,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                fetched_at_ms=fetched_at_ms,
+            )
+            observations.extend(gate_observations)
+            metrics.update(gate_metrics)
+        except Exception as exc:  # noqa: BLE001
+            metrics["gate_history"] = {
                 "status": "unavailable",
                 "records": 0,
-                "error": str(result)[:240],
+                "error": str(exc)[:240],
             }
-            continue
-        metric_observations, summary = result
-        observations.extend(metric_observations)
-        metrics[metric] = summary
+
+    if exchange == "binance":
+        for metric, result in zip(metric_names, results, strict=True):
+            if isinstance(result, BaseException):
+                metrics[metric] = {
+                    "status": "unavailable",
+                    "records": 0,
+                    "error": str(result)[:240],
+                }
+                continue
+            metric_observations, summary = result
+            observations.extend(metric_observations)
+            metrics[metric] = summary
 
     return {
         "run_id": str(uuid.uuid4()),

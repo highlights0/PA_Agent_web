@@ -215,7 +215,9 @@ def test_derivatives_archive_keeps_historical_and_snapshot_data_separate(tmp_pat
     )
     assert {item["data_kind"] for item in rows} == {"historical", "snapshot"}
     snapshot = next(item for item in rows if item["data_kind"] == "snapshot")
-    assert snapshot["event_time_ms"] == snapshot["fetched_at_ms"]
+    assert snapshot["event_time_ms"] == 900
+    assert snapshot["available_at_ms"] == snapshot["fetched_at_ms"]
+    assert snapshot["fetched_at_ms"] > snapshot["event_time_ms"]
     assert snapshot["raw"]["data_timestamp"] == 900
     assert snapshot["source_endpoint"].endswith("/context")
 

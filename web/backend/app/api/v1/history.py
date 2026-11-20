@@ -395,7 +395,7 @@ async def _backfill_one_item(app: Any, payload: BackfillInput) -> dict[str, Any]
     }
 
 
-async def _run_batch_backfill(app: Any, job_id: str, owner: str, jobs: list[dict[str, Any]]) -> None:
+async def _run_batch_backfill(app: Any, job_id: str, jobs: list[dict[str, Any]]) -> None:
     job_store = app.state.backfill_jobs
     job_store.set_running(job_id)
     async with app.state.backfill_semaphore:
@@ -407,6 +407,7 @@ async def _run_batch_backfill(app: Any, job_id: str, owner: str, jobs: list[dict
                 result = {
                     "status": "failed",
                     **item,
+                    "requested_bars": item.get("bars", 0),
                     "error": str(exc)[:300],
                 }
             job_store.complete_item(job_id, result)
@@ -433,7 +434,7 @@ async def start_batch_backfill(payload: BatchBackfillInput, request: Request):
     owner = _owner(request)
     job = request.app.state.backfill_jobs.create(owner, items)
     task = asyncio.create_task(
-        _run_batch_backfill(request.app, job["job_id"], owner, items)
+        _run_batch_backfill(request.app, job["job_id"], items)
     )
     request.app.state.backfill_tasks.add(task)
     task.add_done_callback(request.app.state.backfill_tasks.discard)

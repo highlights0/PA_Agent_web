@@ -196,6 +196,57 @@ export interface MarketCandleArchiveStats {
   newest_open_time_ms: number | null;
 }
 
+export interface DerivativesObservation {
+  market: "usdm";
+  exchange: FuturesExchange;
+  symbol: string;
+  metric: string;
+  period: string;
+  event_time_ms: number;
+  fetched_at_ms: number;
+  data_kind: "historical" | "snapshot";
+  value: Record<string, any>;
+  raw: Record<string, any>;
+  source_endpoint: string;
+  quality: string;
+}
+
+export interface DerivativesCollectionReport {
+  run_id: string;
+  market: "usdm";
+  exchange: FuturesExchange;
+  symbol: string;
+  period: string;
+  start_time_ms: number;
+  end_time_ms: number;
+  fetched_at_ms: number;
+  status: string;
+  observation_count: number;
+  stored_observations: number;
+  metrics: Record<string, {
+    status: string;
+    records: number;
+    pages?: number;
+    source_endpoint?: string;
+    effective_start_ms?: number;
+    error?: string;
+  }>;
+  note: string;
+}
+
+export interface DerivativesArchiveStats {
+  market: "usdm";
+  exchange: FuturesExchange;
+  symbol: string;
+  metric: string;
+  period: string;
+  data_kind: "historical" | "snapshot";
+  record_count: number;
+  oldest_event_time_ms: number;
+  newest_event_time_ms: number;
+  last_fetched_at_ms: number;
+}
+
 export interface BatchBackfillResult {
   status: "completed" | "failed";
   market: Market;
@@ -465,6 +516,50 @@ export const api = {
     );
     return request<{ items: MarketCandleArchiveStats[] }>(
       "/api/v1/history/candles/stats?" + query.toString(),
+    );
+  },
+  backfillDerivatives: (payload: {
+    market: "usdm"; exchange: FuturesExchange; symbol: string;
+    period: string; start_ms: number; end_ms: number;
+  }) =>
+    request<DerivativesCollectionReport>("/api/v1/history/derivatives/backfill", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  listDerivatives: (payload: {
+    exchange: FuturesExchange; symbol: string; market?: "usdm";
+    start_ms?: number; end_ms?: number; metric?: string; period?: string;
+    data_kind?: "historical" | "snapshot"; limit?: number;
+  }) => {
+    const query = new URLSearchParams(
+      Object.entries(payload).filter((entry): entry is [string, string] =>
+        entry[1] !== undefined && entry[1] !== null && entry[1] !== "",
+      ).map(([key, value]) => [key, String(value)]),
+    );
+    return request<{ items: DerivativesObservation[] }>(
+      "/api/v1/history/derivatives?" + query.toString(),
+    );
+  },
+  derivativesStats: (payload: {
+    exchange?: FuturesExchange; symbol?: string; market?: "usdm";
+  } = {}) => {
+    const query = new URLSearchParams(
+      Object.entries(payload).filter((entry): entry is [string, string] => Boolean(entry[1])),
+    );
+    return request<{ items: DerivativesArchiveStats[] }>(
+      "/api/v1/history/derivatives/stats?" + query.toString(),
+    );
+  },
+  derivativesRuns: (payload: {
+    exchange: FuturesExchange; symbol: string; market?: "usdm"; limit?: number;
+  }) => {
+    const query = new URLSearchParams(
+      Object.entries(payload).filter((entry): entry is [string, string] =>
+        entry[1] !== undefined && entry[1] !== null,
+      ).map(([key, value]) => [key, String(value)]),
+    );
+    return request<{ items: Array<Record<string, any>> }>(
+      "/api/v1/history/derivatives/runs?" + query.toString(),
     );
   },
   evaluateDataset: (payload: { market: Market; exchange: Exchange; symbol: string; timeframe: string }) => {

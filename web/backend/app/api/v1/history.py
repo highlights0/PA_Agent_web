@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.ai_settings import _authorize
+from app.services.analysis_service import AnalysisConfigurationError
 from app.services.historical_backfill import backfill_market_candles
 from app.services.derivatives_history import collect_derivatives_history
 from app.services.historical_replay import select_replay_decision_times
@@ -492,6 +493,10 @@ async def start_historical_replay(payload: HistoricalReplayInput, request: Reque
         raise HTTPException(status_code=422, detail="单次回放时间范围不能超过 366 天")
     if payload.analysis_bars + 50 > request.app.state.settings.max_klines:
         raise HTTPException(status_code=422, detail="分析 K 线数量超过服务器限制")
+    try:
+        request.app.state.analysis_service._active_provider()
+    except AnalysisConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     required_bars = payload.analysis_bars + 50
     archived = await asyncio.to_thread(

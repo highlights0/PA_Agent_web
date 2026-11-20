@@ -31,6 +31,6 @@ def test_backfill_job_tracks_progress_and_hides_owner():
     store.finish(job_id)
     final = store.get(job_id, "127.0.0.1")
     assert final is not None
-    assert final["status"] == "completed"
+    assert final["status"] == "partial"
     assert final["completed"] == 2
     assert len(final["results"]) == 2

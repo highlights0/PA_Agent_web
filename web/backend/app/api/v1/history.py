@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api.v1.ai_settings import _authorize
-from app.services.historical_backfill import backfill_gate_candles
+from app.services.historical_backfill import backfill_market_candles
 from app.services.baseline_evaluation import evaluate_rule_baseline
 from app.services.segmenter import build_current_features, build_segment_samples
 
@@ -182,29 +182,37 @@ async def build_historical_dataset(payload: DatasetBuildInput, request: Request)
 
 class BackfillInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    market: Literal["usdm"] = "usdm"
-    exchange: Literal["gate"] = "gate"
+    market: Literal["spot", "usdm"]
+    exchange: Literal["binance", "binance_us", "coinbase", "gate"]
     symbol: str = Field(min_length=3, max_length=32)
-    timeframe: Literal["1m", "5m", "15m", "30m", "1h", "4h", "8h", "1d", "7d"] = "15m"
+    timeframe: str = Field(min_length=2, max_length=8)
     bars: int = Field(default=3000, ge=80, le=12000)
 
 
 @router.post("/history/dataset/backfill")
 async def backfill_history(payload: BackfillInput, request: Request):
-    """Bounded Gate backfill; each page uses from/to without limit."""
+    """Backfill a bounded time range from the explicitly selected exchange."""
     symbol = _symbol(payload.symbol)
     try:
-        response = await backfill_gate_candles(
-            request.app.state.market_service._gate_futures,
+        response = await backfill_market_candles(
+            request.app.state.market_service,
+            market=payload.market,
+            exchange=payload.exchange,
             symbol=symbol,
             timeframe=payload.timeframe,
             requested_bars=payload.bars,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"历史回补参数不受支持：{str(exc)[:240]}") from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Gate 历史回补失败：{str(exc)[:240]}") from exc
+        raise HTTPException(status_code=502, detail=f"历史 K 线回补失败：{str(exc)[:240]}") from exc
+
     samples = build_segment_samples(
-        response["bars"], market="usdm", exchange="gate",
-        symbol=symbol, timeframe=payload.timeframe,
+        response["bars"],
+        market=payload.market,
+        exchange=payload.exchange,
+        symbol=symbol,
+        timeframe=payload.timeframe,
     )
     new_samples = _history(request).upsert_segments(samples)
     return {
@@ -215,10 +223,16 @@ async def backfill_history(payload: BackfillInput, request: Request):
         "truncated": response["truncated"],
         "new_samples": new_samples,
         "dataset": _history(request).dataset_stats(
-            market="usdm", exchange="gate",
-            symbol=symbol, timeframe=payload.timeframe,
+            market=payload.market,
+            exchange=payload.exchange,
+            symbol=symbol,
+            timeframe=payload.timeframe,
         ),
-        "note": "Gate 时间范围分页回补；不跨缺失 K 线生成未来标签。回补数据仅用于样本与评估，不自动修改 AI 决策。",
+        "note": (
+            f"{payload.exchange} 历史 K 线分页回补完成；"
+            "缺失 K 线会保留为时间缺口，样本生成不会跨缺口构造未来标签。"
+            "回补数据仅用于样本与评估，不自动修改 AI 决策。"
+        ),
     }
 
 

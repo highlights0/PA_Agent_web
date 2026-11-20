@@ -79,7 +79,12 @@ class BackfillJobStore:
             if job is None:
                 return
             successes = sum(1 for item in job["results"] if item.get("status") == "completed")
-            job["status"] = "completed" if successes else "failed"
+            if successes == job["total"]:
+                job["status"] = "completed"
+            elif successes:
+                job["status"] = "partial"
+            else:
+                job["status"] = "failed"
             job["current"] = None
             job["finished_at"] = _now()
             job["updated_at"] = job["finished_at"]

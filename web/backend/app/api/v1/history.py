@@ -595,7 +595,7 @@ async def _run_historical_replay(
                     "stage1_diagnosis": run.record.stage1_diagnosis,
                     "stage2_decision": run.record.stage2_decision,
                     "usage": run.record.usage_total,
-                    "error": run.record.exception,
+                    "error": run.details.get("exception"),
                     "trace": run.trace,
                     "details": run.details,
                     "historical_replay": True,
@@ -624,22 +624,25 @@ async def _run_historical_replay(
                 )
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)[:400]
-                await asyncio.to_thread(
-                    app.state.history_store.save_analysis,
-                    analysis_id=analysis_id,
-                    owner=owner,
-                    request_data=request_data,
-                    status="failed",
-                    result={
-                        "analysis_id": analysis_id,
-                        "status": "failed",
-                        "error": {"message": message},
-                        "historical_replay": True,
-                    },
-                    trace=trace_events,
-                    details={},
-                    created_at=created_at,
-                )
+                try:
+                    await asyncio.to_thread(
+                        app.state.history_store.save_analysis,
+                        analysis_id=analysis_id,
+                        owner=owner,
+                        request_data=request_data,
+                        status="failed",
+                        result={
+                            "analysis_id": analysis_id,
+                            "status": "failed",
+                            "error": {"message": message},
+                            "historical_replay": True,
+                        },
+                        trace=trace_events,
+                        details={},
+                        created_at=created_at,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to persist failed historical replay result")
                 jobs.complete_item(
                     job_id,
                     {
